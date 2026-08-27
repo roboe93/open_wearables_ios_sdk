@@ -452,6 +452,27 @@ extension OpenWearablesHealthSDK {
         ]
     }
 
+    // MARK: - Mirror detection
+
+    /// The measurement a sample describes, stripped of who wrote it.
+    ///
+    /// `nil` for anything the ledger has no opinion about — only quantity
+    /// samples describe a measurement that another app can mirror verbatim.
+    internal func measurementKey(for sample: HKSample) -> MeasurementKey? {
+        guard let q = sample as? HKQuantitySample else { return nil }
+
+        let (unit, _) = _defaultUnit(for: q.quantityType)
+        let effectiveUnit = q.quantity.is(compatibleWith: unit)
+            ? unit
+            : _getFallbackUnit(for: q.quantityType)
+        guard q.quantity.is(compatibleWith: effectiveUnit) else { return nil }
+
+        return MeasurementKey(type: q.quantityType.identifier,
+                              start: q.startDate,
+                              end: q.endDate,
+                              value: q.quantity.doubleValue(for: effectiveUnit))
+    }
+
     // MARK: - Units / helpers
 
     private func _getFallbackUnit(for qt: HKQuantityType) -> HKUnit {

@@ -136,6 +136,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Per-user state (anchors)
     internal let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
 
+    /// Remembers which body measurements were already delivered, so a copy
+    /// written by a second app does not count as a second measurement.
+    internal lazy var mirrorDedupe = MirrorDedupeLedger(storage: defaults)
+
     // Observer queries
     internal var activeObserverQueries: [HKObserverQuery] = []
 
@@ -263,6 +267,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
+        mirrorDedupe.reset()
         OpenWearablesHealthSdkKeychain.clearAll()
         
         logMessage("Sign out complete - all sync state reset")
@@ -417,6 +422,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
+        // The full re-export is expected to carry the whole history again.
+        // Filtering it against the old ledger would silently thin it out.
+        mirrorDedupe.reset()
         logMessage("Anchors reset - will perform full sync on next sync")
         
         if OpenWearablesHealthSdkKeychain.isSyncActive() && self.hasAuth {
@@ -427,6 +435,22 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
+    /// Forget which measurements were already delivered.
+    ///
+    /// Call this whenever anchors are reset from outside the SDK, for a single
+    /// type or for all of them. Without it the repeated fetch is compared
+    /// against the previous run: every sample looks like a copy of one already
+    /// sent, and nothing arrives.
+    ///
+    /// - Parameter identifiers: HealthKit type identifiers, or `nil` for all.
+    public func resetMirrorDedupe(forTypes identifiers: [String]? = nil) {
+        if let identifiers {
+            mirrorDedupe.forget(types: Set(identifiers))
+        } else {
+            mirrorDedupe.reset()
+        }
+    }
+
     /// Get stored credentials.
     public func getStoredCredentials() -> [String: Any?] {
         return [
@@ -779,14 +803,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
-            let payload = self.serializeCombinedStreaming(samples: allSamples)
+            // Phase 2b: Drop measurements a second app mirrored back into
+            // Health. They carry a distinct UUID, so nothing downstream can
+            // recognise them as the same weigh-in. See `MirrorDedupeLedger`.
+            let deduped = self.mirrorDedupe.filterMirrored(allSamples) { self.measurementKey(for: $0) }
+            let sendableSamples = deduped.kept
+            let mirrored = allSamples.count - sendableSamples.count
+            if mirrored > 0 {
+                self.logMessage("  Skipped \(mirrored) mirrored sample(s) already covered by another app")
+            }
             
-            self.enqueueCombinedUpload(
-                payload: payload, anchors: [:], endpoint: endpoint,
-                credential: freshCredential, wasFullExport: false
-            ) { [weak self] sendSuccess in
+            // Everything after a confirmed upload. Also runs when the round
+            // held nothing but mirrors: the cursors advanced all the same, and
+            // leaving them unwritten would repeat this round forever.
+            let afterUpload: () -> Void = { [weak self] in
                 guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
+                
+                self.mirrorDedupe.commit(deduped.newKeys)
                 
                 // Phase 3: Update progress for all types that had data
                 for result in withData {
@@ -823,6 +856,21 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         completion: completion
                     )
                 }
+            }
+            
+            guard !sendableSamples.isEmpty else {
+                afterUpload()
+                return
+            }
+            
+            let payload = self.serializeCombinedStreaming(samples: sendableSamples)
+            
+            self.enqueueCombinedUpload(
+                payload: payload, anchors: [:], endpoint: endpoint,
+                credential: freshCredential, wasFullExport: false
+            ) { sendSuccess in
+                if !sendSuccess { completion(false); return }
+                afterUpload()
             }
         }
     }
