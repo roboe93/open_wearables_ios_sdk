@@ -173,7 +173,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
 extension OpenWearablesHealthSDK {
 
     // MARK: - Public API
-    internal func serialize(samples: [HKSample], type: HKSampleType) -> [String: Any] {
+    internal func serialize(samples: [HKSample], type: HKSampleType,
+                            routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -181,7 +182,7 @@ extension OpenWearablesHealthSDK {
 
         for s in samples {
             if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w))
+                workouts.append(_mapWorkout(w, routes: routes))
             } else if let q = s as? HKQuantitySample {
                 records.append(_mapQuantity(q))
             } else if let c = s as? HKCategorySample {
@@ -221,7 +222,8 @@ extension OpenWearablesHealthSDK {
     }
     
     // MARK: - Memory-efficient streaming serialization
-    internal func serializeCombinedStreaming(samples: [HKSample]) -> [String: Any] {
+    internal func serializeCombinedStreaming(samples: [HKSample],
+                                             routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -236,7 +238,8 @@ extension OpenWearablesHealthSDK {
                 
                 for s in batch {
                     if let w = s as? HKWorkout {
-                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter))
+                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter,
+                                                             routes: routes))
                     } else if let q = s as? HKQuantitySample {
                         records.append(_mapQuantityEfficient(q, dateFormatter: dateFormatter))
                     } else if let c = s as? HKCategorySample {
@@ -278,7 +281,8 @@ extension OpenWearablesHealthSDK {
     }
     
     // MARK: - Combined serialization (legacy)
-    internal func serializeCombined(samples: [HKSample], anchors: [String: HKQueryAnchor]) -> [String: Any] {
+    internal func serializeCombined(samples: [HKSample], anchors: [String: HKQueryAnchor],
+                                    routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -286,7 +290,7 @@ extension OpenWearablesHealthSDK {
         
         for s in samples {
             if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w))
+                workouts.append(_mapWorkout(w, routes: routes))
             } else if let q = s as? HKQuantitySample {
                 records.append(_mapQuantity(q))
             } else if let c = s as? HKCategorySample {
@@ -429,9 +433,10 @@ extension OpenWearablesHealthSDK {
         return records
     }
 
-    private func _mapWorkout(_ w: HKWorkout) -> [String: Any] {
+    private func _mapWorkout(_ w: HKWorkout, routes: [UUID: [RouteFix]]) -> [String: Any] {
         let df = ISO8601DateFormatter()
         let stats = _buildWorkoutStats(w)
+        let route = _routePayload(for: w, routes: routes, dateFormatter: df)
 
         return [
             "id": w.uuid.uuidString,
@@ -446,10 +451,23 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": NSNull(),
-            "route": NSNull(),
+            "route": route,
             "samples": NSNull(),
             "metadata": NSNull()
         ]
+    }
+
+    // MARK: - Workout route
+
+    /// The workout's track, or `NSNull()` when there is none.
+    ///
+    /// Indoor workouts have no route, and that is not a gap to report — the
+    /// backend leaves the column null and says so on the detail page.
+    private func _routePayload(for workout: HKWorkout,
+                               routes: [UUID: [RouteFix]],
+                               dateFormatter: ISO8601DateFormatter) -> Any {
+        guard let fixes = routes[workout.uuid], !fixes.isEmpty else { return NSNull() }
+        return WorkoutRoute.payload(fixes, dateFormatter: dateFormatter)
     }
 
     // MARK: - Mirror detection
@@ -752,8 +770,10 @@ extension OpenWearablesHealthSDK {
         return records
     }
 
-    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> [String: Any] {
+    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter,
+                                      routes: [UUID: [RouteFix]]) -> [String: Any] {
         let stats = _buildWorkoutStats(w)
+        let route = _routePayload(for: w, routes: routes, dateFormatter: dateFormatter)
 
         return [
             "id": w.uuid.uuidString,
@@ -768,7 +788,7 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": NSNull(),
-            "route": NSNull(),
+            "route": route,
             "samples": NSNull(),
             "metadata": NSNull()
         ]

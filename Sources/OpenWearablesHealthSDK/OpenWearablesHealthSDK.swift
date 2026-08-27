@@ -495,7 +495,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        let readTypes = Set(getQueryableTypes())
+        let readTypes = readAuthorizationTypes()
         logMessage("Requesting read-only auth for \(readTypes.count) types")
         
         healthStore.requestAuthorization(toShare: nil, read: readTypes) { ok, _ in
@@ -507,6 +507,21 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return authCredential
     }
     
+    /// What to ask the user for.
+    ///
+    /// Wider than `getQueryableTypes()` by exactly one entry: the workout route
+    /// is a series type of its own and is not covered by permission for
+    /// workouts. It deliberately stays out of the queryable types — those drive
+    /// the round-robin and the observers, and a route sample fetched that way
+    /// would be serialized as a nameless record instead of as a track.
+    internal func readAuthorizationTypes() -> Set<HKObjectType> {
+        var types = Set(getQueryableTypes().map { $0 as HKObjectType })
+        if trackedTypes.contains(where: { $0 is HKWorkoutType }) {
+            types.insert(Self.workoutRouteType)
+        }
+        return types
+    }
+
     internal func getQueryableTypes() -> [HKSampleType] {
         let disallowedIdentifiers: Set<String> = [
             HKCorrelationTypeIdentifier.bloodPressure.rawValue
@@ -863,14 +878,26 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
-            let payload = self.serializeCombinedStreaming(samples: sendableSamples)
-            
-            self.enqueueCombinedUpload(
-                payload: payload, anchors: [:], endpoint: endpoint,
-                credential: freshCredential, wasFullExport: false
-            ) { sendSuccess in
-                if !sendSuccess { completion(false); return }
-                afterUpload()
+            // Routen liegen nicht im Workout selbst, sondern in eigenen
+            // Samples, die nur asynchron zu haben sind. Deshalb vor dem
+            // Serialisieren einsammeln statt im Mapper.
+            let workoutsInRound = sendableSamples.compactMap { $0 as? HKWorkout }
+            self.collectRoutes(for: workoutsInRound) { routes in
+                if !routes.isEmpty {
+                    let points = routes.values.reduce(0) { $0 + $1.count }
+                    self.logMessage("  Routes: \(routes.count) workout(s), \(points) fixes")
+                }
+                
+                let payload = self.serializeCombinedStreaming(samples: sendableSamples,
+                                                              routes: routes)
+                
+                self.enqueueCombinedUpload(
+                    payload: payload, anchors: [:], endpoint: endpoint,
+                    credential: freshCredential, wasFullExport: false
+                ) { sendSuccess in
+                    if !sendSuccess { completion(false); return }
+                    afterUpload()
+                }
             }
         }
     }
