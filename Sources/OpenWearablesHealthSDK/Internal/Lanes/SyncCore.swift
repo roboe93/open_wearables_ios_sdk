@@ -130,12 +130,15 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
 
     private let queue = DispatchQueue(label: "health_sync_core")
 
-    /// Schützt `running`, `livePending`, `waiters` und `tightenedDeadline`. Wird nie gehalten, während fremder Code
+    /// Schützt `running`, `livePending`, `waiters`, `roundWaiters` und `tightenedDeadline`. Wird nie gehalten, während fremder Code
     /// (Rückrufe, Waiter) läuft.
     private let stateLock = NSLock()
     private var running = false
     private var livePending = false
     private var waiters: [Waiter] = []
+    /// Die Wartenden der Live-Runde, die gerade läuft. Hier statt in einer lokalen Liste, damit
+    /// `drainWaiters` sie auch dann erreicht, wenn die Runde hängt (Review ME-03).
+    private var roundWaiters: [Waiter] = []
     /// Von außen vorgezogene Frist des laufenden Zyklus (`tighten`). Gilt nur bis zu dessen Ende.
     private var tightenedDeadline: Date?
 
@@ -219,6 +222,22 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         }
     }
 
+    /// Beantwortet sofort alle, die auf eine Live-Runde warten, auch die der Runde, die gerade läuft,
+    /// und vergisst sie (Review ME-03). Für einen Kern, der hängt (ein HealthKit-Rückruf kommt nie)
+    /// oder abgelöst wurde: seine Wartenden bekämen sonst nie eine Antwort. Der Zyklus selbst läuft
+    /// weiter; endet er später, ruft er sie nicht noch einmal.
+    @discardableResult
+    func drainWaiters(with result: CycleResult) -> Int {
+        stateLock.lock()
+        let taken = roundWaiters + waiters
+        roundWaiters = []
+        waiters = []
+        livePending = false
+        stateLock.unlock()
+        for waiter in taken { waiter(result) }
+        return taken.count
+    }
+
     // MARK: Start und Ende
 
     private func start(_ run: CycleRun) {
@@ -275,18 +294,28 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         if livePending && !stopped { return (true, []) }
         running = false
         tightenedDeadline = nil
-        let leftover = waiters
+        let leftover = roundWaiters + waiters
+        roundWaiters = []
         waiters = []
         livePending = false
         return (false, leftover)
     }
 
-    private func takeWaiters() -> [Waiter] {
+    /// Bei Rundenbeginn: die Wartenden gehören ab jetzt zu dieser Runde.
+    private func moveWaitersIntoRound() {
         stateLock.lock()
         defer { stateLock.unlock() }
-        let taken = waiters
+        roundWaiters += waiters
         waiters = []
         livePending = false
+    }
+
+    /// Bei Rundenende: wer zu dieser Runde gehört und noch nicht anders beantwortet wurde.
+    private func takeRoundWaiters() -> [Waiter] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let taken = roundWaiters
+        roundWaiters = []
         return taken
     }
 
@@ -454,11 +483,12 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     /// Eine Live-Runde: Stufe A gebündelt, danach Stufe B Typ für Typ. Wartende Anforderungen werden
     /// bei Rundenbeginn übernommen und nach der Runde mit deren Ergebnis bedient.
     private func runLiveRound(_ run: CycleRun, done: @escaping () -> Void) {
-        let taken = takeWaiters()
+        moveWaitersIntoRound()
         let before = run.tally
 
         liveStage(run, types: run.stageA, bundled: true) { [self] in
             liveStageB(run, index: 0) {
+                let taken = takeRoundWaiters()
                 if !taken.isEmpty {
                     let result = makeResult(run, tally: run.tally.delta(since: before))
                     for waiter in taken { waiter(result) }

@@ -401,8 +401,14 @@ final class OrchestrationSwitchTests: XCTestCase {
             withIsolatedSDK(orchestration: .lanes) { sdk, _ in
                 guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
                 var tightened: [Date] = []
+                var waiters: [(CycleResult) -> Void] = []
                 sdk.registerActiveLanesCycle(ActiveLanesCycle(
-                    generation: generation, requestLiveRound: { _ in true }, tighten: { tightened.append($0) }
+                    generation: generation,
+                    requestLiveRound: { waiter in
+                        waiters.append(waiter)
+                        return true
+                    },
+                    tighten: { tightened.append($0) }
                 ))
                 defer {
                     _ = sdk.releaseActiveLanesCycle(generation: generation)
@@ -410,12 +416,17 @@ final class OrchestrationSwitchTests: XCTestCase {
                 }
 
                 withTrackedTypes([HKQuantityType(.stepCount)], on: sdk) {
+                    var answered = 0
                     let deadline = Date().addingTimeInterval(25)
-                    sdk.sync(trigger: .sdkRefresh, deadline: deadline) { _ in }
+                    sdk.sync(trigger: .sdkRefresh, deadline: deadline) { _ in answered += 1 }
                     XCTAssertEqual(tightened, [deadline])
 
-                    sdk.sync(trigger: .foreground) { _ in }
+                    sdk.sync(trigger: .foreground) { _ in answered += 1 }
                     XCTAssertEqual(tightened, [deadline], "ohne eigene Frist bleibt die des Zyklus")
+
+                    // Die Runde beantworten, damit kein Wartender in den nächsten Test hineinreicht.
+                    for waiter in waiters { waiter(result(.upToDate)) }
+                    XCTAssertTrue(waitUntil { answered == 2 })
                 }
             }
         }
@@ -442,6 +453,111 @@ final class OrchestrationSwitchTests: XCTestCase {
                 XCTAssertEqual(tightened.count, 1)
                 XCTAssertGreaterThanOrEqual(tightened.first ?? .distantPast, before)
                 XCTAssertLessThanOrEqual(tightened.first ?? .distantFuture, Date())
+            }
+        }
+    }
+
+    // MARK: - Wartende eines hängenden oder abgelösten Zyklus (Review ME-03)
+
+    private final class Clock {
+        private let lock = NSLock()
+        private var current = Date(timeIntervalSince1970: 1_791_100_800)
+        var now: Date { lock.lock(); defer { lock.unlock() }; return current }
+        func advance(_ seconds: TimeInterval) { lock.lock(); current = current.addingTimeInterval(seconds); lock.unlock() }
+    }
+
+    /// Übernimmt ein neuer Lauf den Slot eines hängenden Zyklus, bekommen dessen Wartende ihre
+    /// Antwort (`partial(expired)`). Sonst kam die Completion von `sync` nie, und die App hielt ihren
+    /// Anspruch bis zu 15 Minuten.
+    func testATakeoverAnswersTheTriggersWaitingOnTheSupersededCycle() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                let clock = Clock()
+                let previousNow = sdk.now
+                sdk.now = { clock.now }
+                defer { sdk.now = previousNow }
+
+                guard let old = sdk.beginSyncRun() else { return XCTFail("slot") }
+                var waiters: [(CycleResult) -> Void] = []
+                sdk.registerActiveLanesCycle(ActiveLanesCycle(
+                    generation: old,
+                    requestLiveRound: { waiter in
+                        waiters.append(waiter)
+                        return true
+                    },
+                    abandon: { result in
+                        let pending = waiters
+                        waiters = []
+                        for waiter in pending { waiter(result) }
+                    }
+                ))
+
+                withTrackedTypes([HKQuantityType(.stepCount)], on: sdk) {
+                    var outcome: SyncOutcome?
+                    sdk.sync(trigger: .unlock) { outcome = $0 }
+                    XCTAssertEqual(waiters.count, 1)
+
+                    clock.advance(151)
+                    guard let new = sdk.beginSyncRun() else { return XCTFail("Übernahme erwartet") }
+                    defer {
+                        sdk.finishSync(generation: new)
+                        sdk.finishSync(generation: old)
+                    }
+
+                    XCTAssertTrue(waitUntil { outcome != nil })
+                    XCTAssertEqual(outcome?.status, .partial(.expired))
+                    XCTAssertEqual(outcome?.trigger, .unlock)
+                    sdk.lanesCycleLock.lock()
+                    let registered = sdk.activeLanesCycle?.generation
+                    sdk.lanesCycleLock.unlock()
+                    XCTAssertNil(registered, "das Register des alten Zyklus ist abgeräumt")
+                }
+            }
+        }
+    }
+
+    /// Hängt der Zyklus und übernimmt niemand, bekommt der Wartende seine Antwort, sobald die Sperre
+    /// des Zyklus abgelaufen ist. Eine späte Antwort des Zyklus kommt danach nicht mehr durch.
+    func testAWaiterOnACycleThatStopsLivingIsAnsweredOnceItsLeaseHasExpired() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                let clock = Clock()
+                let previousNow = sdk.now
+                let previousInterval = OpenWearablesHealthSDK.handOverCheckInterval
+                sdk.now = { clock.now }
+                OpenWearablesHealthSDK.handOverCheckInterval = 0.05
+                defer {
+                    sdk.now = previousNow
+                    OpenWearablesHealthSDK.handOverCheckInterval = previousInterval
+                }
+
+                guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
+                var waiters: [(CycleResult) -> Void] = []
+                sdk.registerActiveLanesCycle(ActiveLanesCycle(generation: generation) { waiter in
+                    waiters.append(waiter)
+                    return true
+                })
+                defer {
+                    _ = sdk.releaseActiveLanesCycle(generation: generation)
+                    sdk.finishSync(generation: generation)
+                }
+
+                withTrackedTypes([HKQuantityType(.stepCount)], on: sdk) {
+                    var outcomes: [SyncOutcome] = []
+                    sdk.sync(trigger: .network) { outcomes.append($0) }
+                    XCTAssertEqual(waiters.count, 1)
+
+                    spin(0.3)
+                    XCTAssertTrue(outcomes.isEmpty, "solange der Zyklus lebt, wird auf seine Runde gewartet")
+
+                    clock.advance(151)
+                    XCTAssertTrue(waitUntil { !outcomes.isEmpty })
+                    XCTAssertEqual(outcomes.first?.status, .partial(.expired))
+
+                    waiters[0](result(.transferred, live: 3))
+                    spin(0.2)
+                    XCTAssertEqual(outcomes.count, 1, "die späte Antwort kommt nicht noch einmal")
+                }
             }
         }
     }

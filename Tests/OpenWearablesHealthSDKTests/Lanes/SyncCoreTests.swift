@@ -998,6 +998,44 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(second.status, .transferred, "der zweite Zyklus läuft ohne die alte Frist durch")
         XCTAssertTrue(h.sink.deliveries.last?.ids.contains("hr-2") ?? false)
     }
+
+    // MARK: Wartende eines hängenden Zyklus (Review ME-03)
+
+    /// Hängt der Kern (ein HealthKit-Rückruf kommt nie) oder wurde er abgelöst, bekommen seine
+    /// Wartenden über `drainWaiters` ihre Antwort, genau einmal: das späte Ende ruft sie nicht noch
+    /// einmal.
+    func testDrainingTheWaitersOfAHangingCycleAnswersThemOnceAndNotAgainLater() {
+        let h = LaneHarness()
+        h.presetAnchors([weight])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        h.reader.hangingTypes = [weight]
+        let finished = DispatchSemaphore(value: 0)
+        h.core.runCycle(h.context([weight])) { _ in finished.signal() }
+        XCTAssertTrue(waitUntil { h.reader.liveCalls.count == 1 }, "der Kern hängt in der Live-Abfrage")
+
+        let lock = NSLock()
+        var answers: [CycleResult] = []
+        XCTAssertTrue(h.core.requestLiveRound { result in
+            lock.lock()
+            answers.append(result)
+            lock.unlock()
+        })
+        let expired = CycleResult(
+            status: .partial(.expired), liveRecords: 0, backfillRecords: 0, perType: [:], deletionsQueued: 0,
+            backfillPending: false, needsCatchUp: false, events: []
+        )
+
+        XCTAssertEqual(h.core.drainWaiters(with: expired), 1)
+        lock.lock()
+        XCTAssertEqual(answers, [expired])
+        lock.unlock()
+
+        h.reader.releaseHung()
+        XCTAssertEqual(finished.wait(timeout: .now() + 10), .success)
+        lock.lock()
+        XCTAssertEqual(answers.count, 1, "das späte Ende antwortet nicht noch einmal")
+        lock.unlock()
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.

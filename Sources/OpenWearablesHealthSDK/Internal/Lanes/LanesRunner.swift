@@ -80,21 +80,25 @@ extension OpenWearablesHealthSDK {
 // MARK: - Register des laufenden Zyklus
 
 /// Der laufende Zyklus, soweit andere Auslöser ihn brauchen: seine Generation, die Möglichkeit,
-/// eine Live-Runde anzufordern, und seine Frist vorzuziehen (`tighten`, Review ME-01).
+/// eine Live-Runde anzufordern, seine Frist vorzuziehen (`tighten`, Review ME-01) und seine Wartenden
+/// abzufinden, wenn er abgelöst wird (`abandon`, Review ME-03).
 /// `requestLiveRound` liefert `false`, wenn der Kern nicht mehr läuft (der Zyklus endet gerade).
 internal final class ActiveLanesCycle {
     let generation: Int
     let requestLiveRound: (@escaping (CycleResult) -> Void) -> Bool
     let tighten: (Date) -> Void
+    let abandon: (CycleResult) -> Void
 
     init(
         generation: Int,
         requestLiveRound: @escaping (@escaping (CycleResult) -> Void) -> Bool,
-        tighten: @escaping (Date) -> Void = { _ in }
+        tighten: @escaping (Date) -> Void = { _ in },
+        abandon: @escaping (CycleResult) -> Void = { _ in }
     ) {
         self.generation = generation
         self.requestLiveRound = requestLiveRound
         self.tighten = tighten
+        self.abandon = abandon
     }
 }
 
@@ -155,18 +159,26 @@ extension OpenWearablesHealthSDK {
               !isSyncCancelled(generation: active.generation),
               currentLeaseDecision() == .busy else { return false }
 
-        let accepted = active.requestLiveRound { [self] result in
+        // Genau eine Antwort: die der Runde, oder `partial(expired)`, wenn der Zyklus vorher stirbt
+        // (Review ME-03). Was danach noch kommt, fällt durch.
+        let answered = OneShot {}
+        let respond: (CycleResult) -> Void = { [self] result in
+            guard answered.fire() else { return }
             // Die Antwort auf diese Runde. Die Ereignisse stehen im Journal des Zyklus, nicht hier.
             updateLanesNeedsCatchUp(with: result)
             fireObserverCompletions()
             let outcome = lanesOutcome(from: result, trigger: trigger, started: started, leaseTakenOver: false)
             deliverRun(outcome, protectedStart: protectedStart, completion: completion)
         }
+        let accepted = active.requestLiveRound(respond)
         if accepted, let deadline = deadline {
             // Review ME-01: die Frist des Auslösers (BGTask, Observer im Hintergrund) gilt für den
             // laufenden Zyklus. Gibt der Auslöser seinen Task zurück, liefe der Zyklus sonst ohne
             // Frist weiter und würde mittendrin suspendiert.
             active.tighten(deadline)
+        }
+        if accepted {
+            watchHandedOverTrigger(generation: active.generation, answered: answered, respond: respond)
         }
         if !accepted {
             // Der Kern läuft nicht mehr, der Slot ist aber noch nicht frei: nach dem Ende neu starten.
@@ -270,7 +282,8 @@ extension OpenWearablesHealthSDK {
         registerActiveLanesCycle(ActiveLanesCycle(
             generation: generation,
             requestLiveRound: { waiter in core.requestLiveRound(waiter) },
-            tighten: { deadline in core.tighten(deadline: deadline) }
+            tighten: { deadline in core.tighten(deadline: deadline) },
+            abandon: { result in core.drainWaiters(with: result) }
         ))
 
         // Ein gesperrtes iPhone ist nie im Vordergrund: dann gilt das kleine Hintergrund-Chunk,
@@ -403,6 +416,56 @@ extension OpenWearablesHealthSDK {
         let active = activeLanesCycle
         lanesCycleLock.unlock()
         active?.tighten(now)
+    }
+
+    /// Wie oft ein übergebener Auslöser nachsieht, ob sein Zyklus noch lebt (Review ME-03). `var` als
+    /// Testnaht.
+    internal static var handOverCheckInterval: TimeInterval = 30
+
+    /// Die Antwort an Wartende eines Zyklus, der gestorben ist (hängt ohne Lebenszeichen, abgelöst,
+    /// abgebrochen). Ob noch nachgeholt wird, steht in der Datei.
+    internal func expiredCycleResult() -> CycleResult {
+        CycleResult(
+            status: .partial(.expired), liveRecords: 0, backfillRecords: 0, perType: [:], deletionsQueued: 0,
+            backfillPending: lanesBackfillPendingTypeCount(trackedOnly: true) > 0, needsCatchUp: false, events: []
+        )
+    }
+
+    /// Lebt der Zyklus dieser Generation noch: steht im Register, ist nicht abgebrochen, und seine
+    /// Sperre ist nicht abgelaufen.
+    internal func isLanesCycleAlive(generation: Int) -> Bool {
+        lanesCycleLock.lock()
+        let registered = activeLanesCycle?.generation == generation
+        lanesCycleLock.unlock()
+        return registered && !isSyncCancelled(generation: generation) && currentLeaseDecision() == .busy
+    }
+
+    /// Sieht in Abständen nach, ob der Zyklus eines übergebenen Auslösers noch lebt. Stirbt er, bevor
+    /// er geantwortet hat, bekommt der Auslöser `partial(expired)` (Review ME-03). Sonst blieben die
+    /// Completion von `sync`, der Anspruch der App und ihr BGTask hängen, und im Journal stünde für
+    /// den Auslöser nichts.
+    private func watchHandedOverTrigger(generation: Int, answered: OneShot, respond: @escaping (CycleResult) -> Void) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.handOverCheckInterval) { [weak self] in
+            guard let self = self, !answered.hasFired else { return }
+            if self.isLanesCycleAlive(generation: generation) {
+                self.watchHandedOverTrigger(generation: generation, answered: answered, respond: respond)
+            } else {
+                respond(self.expiredCycleResult())
+            }
+        }
+    }
+
+    /// Nach einer Übernahme: der abgelöste Zyklus verlässt das Register, und wer auf seine Live-Runde
+    /// wartet, bekommt `partial(expired)` (Review ME-03). Aufgerufen von `beginSyncRun`.
+    internal func abandonSupersededLanesCycle(newGeneration: Int) {
+        lanesCycleLock.lock()
+        guard let old = activeLanesCycle, old.generation != newGeneration else {
+            lanesCycleLock.unlock()
+            return
+        }
+        activeLanesCycle = nil
+        lanesCycleLock.unlock()
+        old.abandon(expiredCycleResult())
     }
 
     /// Obergrenze der Frist eines Observer-Laufs im Hintergrund, falls iOS unbegrenzte Zeit meldet.

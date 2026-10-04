@@ -1760,6 +1760,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             // in-flight uploads are cancelled so they do not hold the foreground session.
             cancelInFlightSyncUploads(reason: reason == "leaseExpired" ? "leaseExpired" : "syncTakeover")
             journalLeaseTakeover(reason: reason, previousGeneration: previousGeneration, newGeneration: generation, at: current)
+            // Fork (review ME-03): triggers waiting on a live round of the superseded lanes cycle
+            // get their answer now instead of never.
+            abandonSupersededLanesCycle(newGeneration: generation)
         }
         return generation
     }
