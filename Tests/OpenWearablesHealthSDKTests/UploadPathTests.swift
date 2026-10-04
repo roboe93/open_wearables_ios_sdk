@@ -130,4 +130,33 @@ final class UploadPathTests: XCTestCase {
             XCTAssertEqual(outcome, false)
         }
     }
+
+    /// Review LO-12: Eine 422 von FastAPI/Pydantic trägt im Feld `input` den abgewiesenen Wert, also
+    /// Gesundheitswerte. Ins Log (und von dort ins Sitzungsprotokoll der App) kommen nur Status,
+    /// Größe und `detail[].type`/`loc`, nie der Antworttext.
+    func testTheBodyOfARejectionNeverReachesTheLog() {
+        withIsolatedSDK { sdk, _ in
+            let previousLog = sdk.onLog
+            let lock = NSLock()
+            var lines: [String] = []
+            sdk.onLog = { line in
+                lock.lock()
+                lines.append(line)
+                lock.unlock()
+            }
+            defer { sdk.onLog = previousLog }
+            let body = #"{"detail":[{"type":"float_parsing","loc":["body","data","records",0,"value"],"msg":"Input should be a valid number","input":"80.1kg-geheim"}]}"#
+            StubURLProtocol.install { _ in .status(422, body) }
+
+            XCTAssertEqual(upload(on: sdk), false)
+
+            lock.lock()
+            let logged = lines.joined(separator: "\n")
+            lock.unlock()
+            XCTAssertFalse(logged.contains("geheim"), logged)
+            XCTAssertFalse(logged.contains("80.1"), logged)
+            XCTAssertTrue(logged.contains("422"), logged)
+            XCTAssertTrue(logged.contains("float_parsing"), "der Fehlertyp bleibt für die Diagnose: \(logged)")
+        }
+    }
 }

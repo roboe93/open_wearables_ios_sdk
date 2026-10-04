@@ -104,6 +104,23 @@ extension OpenWearablesHealthSDK {
         return cancellationAttribution() == "backgroundExpiration"
     }
 
+    /// Fork (review LO-12): what may be logged about an error response. Size plus, for a
+    /// FastAPI/Pydantic body, `detail[].type` and `detail[].loc` (field paths, no values). Never
+    /// `msg` or `input`.
+    internal static func errorBodySummary(_ data: Data) -> String {
+        var summary = "\(data.count) bytes"
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let details = object["detail"] as? [[String: Any]], !details.isEmpty else { return summary }
+        let shown = details.prefix(5).map { detail -> String in
+            let type = detail["type"] as? String ?? "?"
+            let loc = (detail["loc"] as? [Any])?.map { "\($0)" }.joined(separator: ".") ?? "?"
+            return "\(type)@\(loc)"
+        }
+        summary += ", detail: " + shown.joined(separator: ", ")
+        if details.count > shown.count { summary += ", +\(details.count - shown.count)" }
+        return summary
+    }
+
     internal func uploadCombinedPayloadReportingStatus(
         payload: [String: Any],
         endpoint: URL,
@@ -175,9 +192,10 @@ extension OpenWearablesHealthSDK {
                 return
             }
             
-            if let data = data, let errorBody = String(data: data, encoding: .utf8), !errorBody.isEmpty {
-                let truncated = errorBody.count > 200 ? String(errorBody.prefix(200)) + "..." : errorBody
-                self.logDiagnostic("HTTP \(statusCode) - \(truncated)")
+            if let data = data, !data.isEmpty {
+                // Fork (review LO-12): never the body itself. A 422 from FastAPI/Pydantic echoes the
+                // rejected value in `input`, i.e. health data, and this line reaches the app's log.
+                self.logDiagnostic("HTTP \(statusCode) - \(OpenWearablesHealthSDK.errorBodySummary(data))")
             }
             
             if (400...499).contains(statusCode) {
