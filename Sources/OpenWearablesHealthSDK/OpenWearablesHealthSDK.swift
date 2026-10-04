@@ -249,6 +249,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var deferredLanesTriggers: [DeferredLanesTrigger] = []
     internal let lanesCycleLock = NSLock()
     
+    // Fork (Plan 05-08): the completion handlers of observer queries that wait for a live round
+    // (observer contract, `Lanes/LaneControls.swift`), and the one-shot flag of the debug hook
+    // that makes the next live fetch hang (scenario "hanging lease"; the flag exists in debug
+    // builds only).
+    internal let observerCompletions = ObserverCompletions()
+    #if DEBUG
+    internal var hangNextLiveFetchArmed = false
+    internal let hangFlagLock = NSLock()
+    #endif
+    
     // Fork: statistics per run, filled by the places that know why a run ended and
     // read once when the outcome is built. See `Lanes/RunStats.swift`.
     internal var runStatsByGeneration: [Int: RunStats] = [:]
@@ -1127,6 +1137,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         completion: @escaping (SyncOutcome) -> Void
     ) {
         let now = Date()
+        // Fork (Plan 05-08): a run that never began leaves nothing an observer could wait for.
+        fireObserverCompletions()
         deliverRun(
             // Fork: the mode that would have run, not always `.upstream`.
             SyncOutcome(status: status, orchestration: orchestration, trigger: trigger, started: now, finished: now),

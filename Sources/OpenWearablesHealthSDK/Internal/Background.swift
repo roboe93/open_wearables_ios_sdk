@@ -27,8 +27,12 @@ extension OpenWearablesHealthSDK {
                     return
                 }
 
-                self.triggerCombinedSync(typeIdentifier: type.identifier)
-                completionHandler()
+                // Fork (Plan 05-08), observer contract: in lanes mode the completion is wrapped in a
+                // `OneShot` (LaneControls.swift) and comes after the live round, at the latest after
+                // 20 s, exactly once. In upstream mode it comes right away as before. HealthKit
+                // throttles the delivery when the completion stays out three times; it used to come
+                // before any work was done.
+                self.handleObserverWake(typeIdentifier: type.identifier, completionHandler: completionHandler)
             }
             healthStore.execute(observer)
             activeObserverQueries.append(observer)

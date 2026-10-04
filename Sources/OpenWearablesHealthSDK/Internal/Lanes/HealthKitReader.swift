@@ -47,6 +47,18 @@ final class HealthKitReader: HealthReading {
         typeId: String, anchor: AnchorToken, limit: Int,
         completion: @escaping (Result<LiveChunk<HKSample>, ReadFailure>) -> Void
     ) {
+        #if DEBUG
+        // Szenario "hängende Sperre" (Plan 05-08, T-05-32): ein HealthKit-Rückruf, der nie kommt.
+        // Das Flag ist ein Einmal-Flag und nur in Debug-Builds vorhanden; die Completion wird nie
+        // gerufen, die Lease übernimmt nach ihrer Frist.
+        if let sdk = sdk, sdk.consumeHangNextLiveFetch() {
+            sdk.runJournal.record(SyncJournalEntry(
+                at: Date(), kind: "spike", note: "hang fired \(sdk.shortTypeName(typeId))"
+            ))
+            sdk.logMessage("Debug: live fetch of \(sdk.shortTypeName(typeId)) hangs on purpose")
+            return
+        }
+        #endif
         guard let sdk = sdk, let type = resolveType(typeId) else {
             completion(.failure(.other("unknown type")))
             return
@@ -180,7 +192,8 @@ final class HealthKitReader: HealthReading {
         }
     }
 
-    private func anchorByPass(
+    /// `internal` seit Plan 05-08: `probeAnchors` (Spike S1) vergleicht beide Wege nebeneinander.
+    func anchorByPass(
         type: HKSampleType, completion: @escaping (Result<AnchorToken, ReadFailure>) -> Void
     ) {
         guard let sdk = sdk else { completion(.failure(.other("sdk released"))); return }
@@ -210,7 +223,7 @@ final class HealthKitReader: HealthReading {
         }
     }
 
-    private func anchorByProbe(
+    func anchorByProbe(
         type: HKSampleType, completion: @escaping (Result<AnchorToken, ReadFailure>) -> Void
     ) {
         guard let sdk = sdk else { completion(.failure(.other("sdk released"))); return }

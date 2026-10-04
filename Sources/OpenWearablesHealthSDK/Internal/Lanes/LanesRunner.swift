@@ -41,6 +41,8 @@ extension OpenWearablesHealthSDK {
             guard previous != newValue else { return }
             logMessage("Orchestration switched: \(previous.rawValue) -> \(newValue.rawValue)")
             cancelSync()
+            // Die laufenden Zyklen enden gleich; was auf eine Live-Runde wartet, wartet nicht mehr.
+            fireObserverCompletions()
             runJournal.record(SyncJournalEntry(
                 at: Date(),
                 kind: "switch",
@@ -150,6 +152,7 @@ extension OpenWearablesHealthSDK {
         let accepted = active.requestLiveRound { [self] result in
             // Die Antwort auf diese Runde. Die Ereignisse stehen im Journal des Zyklus, nicht hier.
             updateLanesNeedsCatchUp(with: result)
+            fireObserverCompletions()
             let outcome = lanesOutcome(from: result, trigger: trigger, started: started, leaseTakenOver: false)
             deliverRun(outcome, protectedStart: protectedStart, completion: completion)
         }
@@ -195,6 +198,7 @@ extension OpenWearablesHealthSDK {
 
         guard let generation = beginSyncRun() else {
             logMessage("Sync in progress, skipping")
+            fireObserverCompletions()
             deliverRun(
                 SyncOutcome(
                     status: .skippedBusy, orchestration: .lanes,
@@ -214,6 +218,7 @@ extension OpenWearablesHealthSDK {
                 trigger: trigger, started: started, finished: Date()
             )
             finishSync(generation: generation)
+            fireObserverCompletions()
             deliverRun(outcome, protectedStart: protectedStart, completion: completion)
         }
 
@@ -275,6 +280,13 @@ extension OpenWearablesHealthSDK {
                     protectedStart: protectedStart, leaseTakenOver: leaseTakenOver(), completion: completion
                 )
             }
+            // Observer contract (Pattern 8): wer auf eine Live-Runde wartet, bekommt seine
+            // Rückmeldung, sobald die erste Runde dieses Zyklus fertig ist. Die Anforderung steht vor
+            // dem Bootstrap in der Warteschlange des Kerns und löst keine zusätzliche Runde aus.
+            // Endet der Zyklus vorher (gesperrt, Fehler), bekommt sie das Zyklusergebnis.
+            core.requestLiveRound { [weak self] _ in
+                self?.fireObserverCompletions()
+            }
         }
 
         // Gesperrt wartet die Übernahme: ohne HealthKit gibt es keinen Anchor für jetzt.
@@ -303,6 +315,8 @@ extension OpenWearablesHealthSDK {
         updateLanesNeedsCatchUp(with: result)
         finishSync(generation: generation)
         let deferred = releaseActiveLanesCycle(generation: generation)
+        // Auch wenn die Live-Runde nie fertig wurde: der Zyklus ist zu Ende, es gibt nichts mehr abzuwarten.
+        fireObserverCompletions()
 
         let grouped = LaneEventSummary.group(result.events)
         journalLaneEvents(grouped)
