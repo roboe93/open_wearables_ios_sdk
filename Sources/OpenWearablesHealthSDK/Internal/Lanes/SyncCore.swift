@@ -46,20 +46,26 @@ private struct Tally {
     var backfillRecords = 0
     var deletionsQueued = 0
     var events: [String] = []
-    var rejectedStatus: Int?
+    /// Jede Abweisung und jeder Fehler in der Reihenfolge, in der sie kamen (Review ME-05). Der Status
+    /// nennt den ersten; die Differenz einer Runde zählt, was in ihr dazukam, statt Werte zu
+    /// vergleichen: derselbe Text wie vorher hieß sonst "nichts passiert".
+    var rejections: [Int] = []
+    var failures: [String] = []
     var locked = false
-    var failure: String?
     /// Die Frist endete die Live-Spur. Eine Frist im Nachholen setzt dies nie.
     var budgetHit = false
     var cancelled = false
     var backgroundTime = false
 
+    var rejectedStatus: Int? { rejections.first }
+    var failure: String? { failures.first }
+
     mutating func setFailure(_ text: String) {
-        if failure == nil { failure = text }
+        failures.append(text)
     }
 
     mutating func setRejected(_ status: Int) {
-        if rejectedStatus == nil { rejectedStatus = status }
+        rejections.append(status)
     }
 
     /// Was seit `earlier` dazukam. Für das Ergebnis einer einzelnen Live-Runde.
@@ -73,9 +79,9 @@ private struct Tally {
         result.backfillRecords = backfillRecords - earlier.backfillRecords
         result.deletionsQueued = deletionsQueued - earlier.deletionsQueued
         result.events = Array(events.dropFirst(earlier.events.count))
-        result.rejectedStatus = rejectedStatus != earlier.rejectedStatus ? rejectedStatus : nil
+        result.rejections = Array(rejections.dropFirst(earlier.rejections.count))
         result.locked = locked && !earlier.locked
-        result.failure = failure != earlier.failure ? failure : nil
+        result.failures = Array(failures.dropFirst(earlier.failures.count))
         result.budgetHit = budgetHit && !earlier.budgetHit
         result.cancelled = cancelled && !earlier.cancelled
         result.backgroundTime = backgroundTime && !earlier.backgroundTime

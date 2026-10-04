@@ -1036,6 +1036,64 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(answers.count, 1, "das späte Ende antwortet nicht noch einmal")
         lock.unlock()
     }
+
+    // MARK: Ergebnis einer Runde (Review ME-05)
+
+    /// Hat der Zyklus schon einen Fehler (Bootstrap), meldet eine spätere Live-Runde ihren eigenen
+    /// Lesefehler trotzdem. Vorher sah die Differenz "gleicher Text wie vorher" und meldete die Runde
+    /// sauber: der Auslöser löschte den Nachholbedarf und fütterte den Totmannschalter.
+    func testALiveRoundAfterAnEarlierFailureStillReportsItsOwnReadFailure() {
+        let h = LaneHarness()
+        let steps = "HKQuantityTypeIdentifierStepCount"
+        for i in 1...4 { h.reader.insert(steps, id: "st-\(i)", endDate: ago(h, Double(i) * 600)) }
+        h.presetAnchors([weight, steps])
+        h.reader.failingAnchorTypes = [heartRate]
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: steps, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+
+        var served: CycleResult?
+        var requested = false
+        h.sink.onDeliver = { [unowned h] delivery in
+            guard delivery.lane == .backfill, !requested else { return }
+            requested = true
+            h.reader.failingTypes[self.weight] = "x"
+            _ = h.core.requestLiveRound { served = $0 }
+        }
+
+        let result = h.run(h.context([heartRate, weight, steps], chunkLimit: 2))
+
+        XCTAssertEqual(result.status, .failed("bootstrap"))
+        XCTAssertEqual(served?.status, .failed("read"), "die Runde meldet ihren eigenen Lesefehler")
+    }
+
+    /// Dasselbe für eine Abweisung: eine Runde, deren Typ abgewiesen wird, ist nicht sauber, auch
+    /// wenn früher im Zyklus schon derselbe Status abgewiesen wurde.
+    func testALiveRoundAfterAnEarlierRejectionStillReportsItsOwnRejection() {
+        let h = LaneHarness()
+        let steps = "HKQuantityTypeIdentifierStepCount"
+        for i in 1...4 { h.reader.insert(steps, id: "st-\(i)", endDate: ago(h, Double(i) * 600)) }
+        h.presetAnchors([weight, bodyFat, steps])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: steps, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+        h.sink.rejectWhen(status: 422) { $0.lane == .live }
+
+        var served: CycleResult?
+        var requested = false
+        h.sink.onDeliver = { [unowned h] delivery in
+            guard delivery.lane == .backfill, !requested else { return }
+            requested = true
+            h.reader.insert(self.bodyFat, id: "bf1", endDate: h.clock.now())
+            _ = h.core.requestLiveRound { served = $0 }
+        }
+
+        let result = h.run(h.context([weight, bodyFat, steps], chunkLimit: 2))
+
+        XCTAssertEqual(result.status, .rejected(httpStatus: 422))
+        XCTAssertEqual(served?.status, .rejected(httpStatus: 422), "die Runde meldet ihre eigene Abweisung")
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.
