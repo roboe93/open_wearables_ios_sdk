@@ -684,6 +684,7 @@ final class OrchestrationSwitchTests: XCTestCase {
     func testTheSyncStatusCarriesTheNewKeysInBothModes() {
         withIsolatedDefaults { _ in
             withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+              withTrackedTypes([HKQuantityType(.heartRate), HKQuantityType(.stepCount)], on: sdk) {
                 sdk.lanesNeedsCatchUp = true
                 var plan = BackfillPlan.empty()
                 plan.start(typeId: "HKQuantityTypeIdentifierHeartRate", now: Date(), daysBack: 14, origin: "request")
@@ -708,6 +709,24 @@ final class OrchestrationSwitchTests: XCTestCase {
 
                 sdk.orchestration = .upstream
                 XCTAssertEqual(sdk.getSyncStatusDict()["orchestration"] as? String, "upstream")
+              }
+            }
+        }
+    }
+
+    /// Review LO-11: Offene Einträge nicht mehr verfolgter Typen bearbeitet der Kern nie. Die
+    /// Diagnose zählt sie deshalb nicht, sonst zeigte sie nie "0 offen".
+    func testTheSyncStatusCountsOnlyTrackedTypesAsPendingBackfill() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                withTrackedTypes([HKQuantityType(.heartRate)], on: sdk) {
+                    var plan = BackfillPlan.empty()
+                    plan.start(typeId: "HKQuantityTypeIdentifierHeartRate", now: Date(), daysBack: 14, origin: "request")
+                    plan.start(typeId: "HKQuantityTypeIdentifierNotTrackedAnymore", now: Date(), daysBack: 14, origin: "request")
+                    try? sdk.makeBackfillStore().save(plan)
+
+                    XCTAssertEqual(sdk.getSyncStatusDict()["backfillPendingTypes"] as? Int, 1)
+                }
             }
         }
     }

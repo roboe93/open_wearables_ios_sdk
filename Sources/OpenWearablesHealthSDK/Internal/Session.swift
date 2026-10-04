@@ -239,7 +239,8 @@ extension OpenWearablesHealthSDK {
         // Fork (Plan 05-08): additive keys, the ones above are unchanged.
         let queue = makeDeletionQueue().stats()
         status["orchestration"] = orchestration.rawValue
-        status["backfillPendingTypes"] = lanesBackfillPendingTypeCount()
+        // Review LO-11: nur verfolgte Typen; einen nicht mehr verfolgten bearbeitet der Kern nie.
+        status["backfillPendingTypes"] = lanesBackfillPendingTypeCount(trackedOnly: true)
         status["needsCatchUp"] = lanesNeedsCatchUp
         status["deletionsQueued"] = queue.total
         status["deletionsUnsent"] = queue.unsent
