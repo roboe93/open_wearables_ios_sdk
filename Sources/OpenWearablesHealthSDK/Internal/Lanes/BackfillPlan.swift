@@ -8,11 +8,14 @@ import Foundation
 // Pitfall 7). `sessionId` dient später als `syncSessionId` der Nachhol-Pakete.
 //
 // Wie ein Typ nachgeholt wird (Pattern 3, D-06): Beim Bootstrap wird der Anchor für "jetzt"
-// festgeschrieben und hier `covered = jetzt` gesetzt. Was danach in Health dazukommt, liefert
-// die Live-Spur über den Anchor. Das Nachholen deckt Samples ab, die davor entstanden sind und
-// ein `endDate` im Fenster `[floor, covered]` haben, neueste zuerst. Einfügereihenfolge (Anchor)
-// und Datum (Fenster) überlappen sich nur, sie unterschneiden sich nie. Eine Überlappung ist
-// harmlos, das Backend nimmt Samples idempotent an.
+// festgeschrieben und hier ein Fenster mit offener Obergrenze angelegt (`covered = jetzt +
+// openEnd`, Review ME-07). Was danach in Health dazukommt, liefert die Live-Spur über den Anchor.
+// Das Nachholen deckt Samples ab, die davor entstanden sind und ein `endDate` im Fenster
+// `[floor, covered]` haben, neueste zuerst. Einfügereihenfolge (Anchor) und Datum (Fenster)
+// überlappen sich nur, sie unterschneiden sich nie. Eine Überlappung ist harmlos, das Backend
+// nimmt Samples idempotent an. Endete das Fenster bei "jetzt", fiele ein Sample, das vor dem
+// Bootstrap eingetragen wurde und in der Zukunft endet (vorgetragene Mahlzeit, vorgehende Uhr),
+// durch beide Spuren: der Anchor-Durchlauf überspringt es, das Fenster auch.
 
 /// Zeitraster des Plans: ganze Millisekunden.
 ///
@@ -114,6 +117,15 @@ struct BackfillPlan: Codable, Equatable {
 
     static let currentVersion = 1
 
+    /// Wie weit das Fenster über "jetzt" hinausreicht (Review ME-07). 400 Tage statt
+    /// `distantFuture`: der Wert übersteht den Weg durch die Datei unverändert und bleibt lesbar.
+    static let openEnd: TimeInterval = 400 * 86_400
+
+    /// Obergrenze eines Fensters, das bei `now` angelegt wird: offen, auf dem Millisekunden-Raster.
+    static func openUpperBound(_ now: Date) -> Date {
+        LaneTime.ceil(now.addingTimeInterval(openEnd))
+    }
+
     var version: Int
     var sessionId: String
     var entries: [String: BackfillEntry]
@@ -126,7 +138,8 @@ struct BackfillPlan: Codable, Equatable {
 
     // MARK: Mutatoren
 
-    /// Legt das Nachholen eines Typs an: Fenster von `daysBack` Tagen bis `now`.
+    /// Legt das Nachholen eines Typs an: Fenster von `daysBack` Tagen vor `now`, nach oben offen
+    /// (`openUpperBound`, Review ME-07).
     ///
     /// Ein offener Typ behält seinen Stand (kein Neubeginn, sonst ginge der Fortschritt verloren);
     /// ein erledigter Typ beginnt neu.
@@ -136,7 +149,7 @@ struct BackfillPlan: Codable, Equatable {
         if let existing = entries[typeId], existing.state == .pending { return false }
         entries[typeId] = BackfillEntry(
             floor: LaneTime.floor(now.addingTimeInterval(-Double(daysBack) * 86_400)),
-            covered: LaneTime.ceil(now),
+            covered: Self.openUpperBound(now),
             startedAt: LaneTime.round(now),
             boundaryIds: [],
             state: .pending,
@@ -206,11 +219,11 @@ struct BackfillPlan: Codable, Equatable {
 
     /// Wiederherstellung nach einem Abbruch zwischen "Plan gespeichert" und "Anchor
     /// festgeschrieben" im Bootstrap: der Typ hat einen offenen Eintrag, aber noch keinen Anchor.
-    /// Der neue Anchor gilt für jetzt, deshalb wächst `covered` bis jetzt, sonst fehlte, was
-    /// zwischen beiden Zeitpunkten entstand. Das frühere Fenster bleibt.
+    /// Der neue Anchor gilt für jetzt, deshalb wächst `covered` bis zur offenen Obergrenze ab jetzt,
+    /// sonst fehlte, was zwischen beiden Zeitpunkten entstand. Das frühere Fenster bleibt.
     mutating func reanchor(typeId: String, now: Date) {
         guard var entry = entries[typeId], entry.state == .pending else { return }
-        let target = LaneTime.ceil(now)
+        let target = Self.openUpperBound(now)
         guard target > entry.covered else { return }
         entry.covered = target
         entry.boundaryIds = []

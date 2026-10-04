@@ -21,7 +21,7 @@ final class BackfillPlanTests: XCTestCase {
         XCTAssertTrue(started)
         let entry = plan.entries[heartRate]
         XCTAssertEqual(entry?.floor, t0.addingTimeInterval(-14 * 86_400))
-        XCTAssertEqual(entry?.covered, t0)
+        XCTAssertEqual(entry?.covered, t0.addingTimeInterval(BackfillPlan.openEnd), "nach oben offen (ME-07)")
         XCTAssertEqual(entry?.startedAt, t0)
         XCTAssertEqual(entry?.state, .pending)
         XCTAssertEqual(entry?.origin, "bootstrap")
@@ -51,8 +51,21 @@ final class BackfillPlanTests: XCTestCase {
 
         XCTAssertTrue(started)
         XCTAssertEqual(plan.entries[heartRate]?.state, .pending)
-        XCTAssertEqual(plan.entries[heartRate]?.covered, later)
+        XCTAssertEqual(plan.entries[heartRate]?.covered, later.addingTimeInterval(BackfillPlan.openEnd))
         XCTAssertEqual(plan.entries[heartRate]?.origin, "reload")
+    }
+
+    /// Review ME-07: Das Fenster des Nachholens endet nicht bei "jetzt". Ein Sample, das vor dem
+    /// Bootstrap eingetragen wurde und in der Zukunft endet (eine Mahlzeit, die YAZIO für den Abend
+    /// vorträgt, eine vorgehende Uhr), läge sonst weder hinter dem Anchor noch im Fenster.
+    func testStartLeavesTheUpperBoundOpenForSamplesThatEndInTheFuture() {
+        var plan = BackfillPlan.empty()
+
+        plan.start(typeId: heartRate, now: t0, daysBack: 14, origin: "bootstrap")
+
+        let covered = plan.entries[heartRate]?.covered ?? .distantPast
+        XCTAssertGreaterThanOrEqual(covered, t0.addingTimeInterval(365 * 86_400))
+        XCTAssertEqual(covered, LaneTime.ceil(t0.addingTimeInterval(BackfillPlan.openEnd)))
     }
 
     // MARK: advance
@@ -210,7 +223,7 @@ final class BackfillPlanTests: XCTestCase {
 
         plan.reanchor(typeId: heartRate, now: later)
 
-        XCTAssertEqual(plan.entries[heartRate]?.covered, later)
+        XCTAssertEqual(plan.entries[heartRate]?.covered, later.addingTimeInterval(BackfillPlan.openEnd))
         XCTAssertEqual(plan.entries[heartRate]?.floor, t0.addingTimeInterval(-14 * 86_400), "das frühere Fenster bleibt")
         XCTAssertEqual(plan.entries[heartRate]?.boundaryIds, [])
     }
@@ -276,7 +289,8 @@ final class BackfillPlanTests: XCTestCase {
 
         let text = String(decoding: try plan.encoded(), as: UTF8.self)
 
-        XCTAssertTrue(text.contains("\"covered\" : \"2026-10-04T08:00:00.000Z\""), text)
+        XCTAssertTrue(text.contains("\"startedAt\" : \"2026-10-04T08:00:00.000Z\""), text)
+        XCTAssertTrue(text.contains("\"covered\" : \"2027-11-08T08:00:00.000Z\""), "nach oben offen (ME-07): \(text)")
         XCTAssertTrue(text.contains("\"floor\" : \"2026-09-20T08:00:00.000Z\""), text)
     }
 

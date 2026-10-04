@@ -1123,6 +1123,21 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(result.backfillRecords, 2)
         XCTAssertEqual(result.perType[heartRate], 2)
     }
+
+    // MARK: Samples, die in der Zukunft enden (Review ME-07)
+
+    /// Vor dem Bootstrap eingetragen, Ende in zwei Stunden: der Anchor-Durchlauf überspringt es, und
+    /// ein Fenster, das bei "jetzt" endet, auch. Mit offener Obergrenze holt das Nachholen es.
+    func testASampleThatEndsInTheFutureIsCaughtUpByTheBootstrap() {
+        let h = LaneHarness()
+        h.reader.insert(heartRate, id: "hr-future", endDate: h.clock.now().addingTimeInterval(7_200))
+        h.reader.insert(heartRate, id: "hr-past", endDate: ago(h, 600))
+
+        let result = h.run(h.context([heartRate]))
+
+        XCTAssertEqual(Set(h.sink.deliveries.flatMap { $0.ids }), ["hr-future", "hr-past"])
+        XCTAssertFalse(result.backfillPending)
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.
