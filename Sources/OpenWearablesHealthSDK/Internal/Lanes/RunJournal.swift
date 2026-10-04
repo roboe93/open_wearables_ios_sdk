@@ -91,6 +91,7 @@ internal enum JournalKind {
     static let wake = "wake"
     static let adoption = "adoption"
     static let delivery = "delivery"
+    static let lease = "lease"
 }
 
 /// Ring aus den jüngsten Einträgen, atomar in eine JSON-Datei geschrieben.
@@ -370,6 +371,18 @@ extension OpenWearablesHealthSDK {
             lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled,
             bgRefresh: backgroundRefreshStatusCache,
             note: note
+        ))
+    }
+
+    /// Ein Lauf hat den Slot an einen neuen verloren (Plan 05-06). Der Grund ist `leaseExpired`
+    /// (Frist ohne Lebenszeichen) oder `cancelled` (abgebrochen und nie zurückgekehrt), dazu die
+    /// beiden Generationen. Nur Zahlen und Kurzwörter, keine Werte.
+    internal func journalLeaseTakeover(reason: String, previousGeneration: Int, newGeneration: Int, at date: Date) {
+        runJournal.record(SyncJournalEntry(
+            at: date,
+            kind: JournalKind.lease,
+            leaseTakenOver: true,
+            note: "takeover:\(reason) previous=\(previousGeneration) new=\(newGeneration)"
         ))
     }
 

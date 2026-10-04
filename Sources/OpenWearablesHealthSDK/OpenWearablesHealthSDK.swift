@@ -182,12 +182,24 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Every generation up to and including this one has been cancelled.
     private var cancelledGeneration: Int = 0
     private var cancelRequestedAt: Date?
-    
-    /// How long a cancelled run may keep the sync slot before the next run takes it
-    /// over. Only reached when a run is wedged (e.g. a HealthKit callback that never
-    /// arrives); without it a single stuck run would block syncing until app restart.
-    private static let cancelledSyncTakeoverDelay: TimeInterval = 60
-    
+
+    // Fork: the sync slot has a lease. A run that gives no sign of life for
+    // `SyncLease.leaseDuration` loses the slot to the next caller, also when nobody ever
+    // cancelled it. The 60 s takeover after `cancelSync()` from 0.15 lives on in the
+    // lease rules of `SyncLease`. Guarded by `syncLock` like `isSyncing`.
+    private var leaseDeadlineStorage: Date?
+
+    /// Fork: clock of the lease, replaceable in tests.
+    internal var now: () -> Date = Date.init
+
+    /// Fork: when the current run loses the slot unless it gives a sign of life. `nil` when
+    /// no run holds the slot. Internal because the lanes runner reads it from another file.
+    internal var leaseDeadline: Date? {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return leaseDeadlineStorage
+    }
+
     /// Whether a sync run currently owns the slot. Stays true after `cancelSync()`
     /// until that run unwinds, so a second loop cannot start on the same SyncState.
     internal var isSyncInProgress: Bool {
@@ -1191,6 +1203,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion(false)
             return
         }
+        // Fork: sign of life before the fetch. A round that stalls here loses its lease.
+        heartbeat(generation: rrState.generation)
         
         let incompleteTypes = types.filter { !rrState.completedTypes.contains($0.identifier) }
         if incompleteTypes.isEmpty {
@@ -1298,6 +1312,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             let afterUpload: () -> Void = { [weak self] in
                 guard let self = self else { completion(false); return }
+                // Fork: sign of life after the upload, also when the run has lost the slot
+                // meanwhile (then it extends nothing).
+                self.heartbeat(generation: rrState.generation)
                 self.mirrorDedupe.commit(deduped.newKeys)
                 if self.isSyncCancelled(generation: rrState.generation) {
                     completion(false)
@@ -1382,6 +1399,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             completion(true, accumulated)
             return
         }
+        
+        // Fork: a round fetches every type in turn. One sign of life per type keeps a live
+        // but slow round from losing its lease between two heartbeats of the round itself.
+        heartbeat(generation: rrState.generation)
         
         let type = types[index]
         
@@ -1580,6 +1601,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, generation: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
+        // Fork: sign of life in every step of the recursion. A dense type needs many steps,
+        // and the lease must not take over a run that is still reading.
+        heartbeat(generation: generation)
         let syncPredicate: NSPredicate? = {
             guard let start = syncStartDate() else { return nil }
             return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
@@ -1621,34 +1645,55 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// another run still owns it.
     internal func beginSyncRun() -> Int? {
         syncLock.lock()
-        
-        var takeOverStaleRun = false
-        if isSyncing {
-            // Only after cancelSync(): a HealthKit callback that never arrives
-            // without a cancel still holds the slot until process death. That is
-            // preferable to silently starting a second writer on SyncState.
-            guard let requestedAt = cancelRequestedAt,
-                  Date().timeIntervalSince(requestedAt) > OpenWearablesHealthSDK.cancelledSyncTakeoverDelay else {
-                syncLock.unlock()
-                return nil
-            }
-            takeOverStaleRun = true
-            NSLog("[OpenWearablesHealthSDK] Cancelled sync did not unwind - taking over the sync slot")
+
+        // Fork: the decision lives in `SyncLease` (a pure function). It keeps the rule of 0.15 (take
+        // over 60 s after cancelSync()) and adds the lease: a run without a sign of life
+        // for `leaseDuration` loses the slot, also when nobody cancelled it. Otherwise a
+        // HealthKit callback that never arrives holds the slot until process death.
+        let current = now()
+        let previousGeneration = syncGeneration
+        var takeOverReason: String?
+        switch SyncLease.decide(
+            isSyncing: isSyncing, cancelRequestedAt: cancelRequestedAt,
+            leaseDeadline: leaseDeadlineStorage, now: current
+        ) {
+        case .busy:
+            syncLock.unlock()
+            return nil
+        case .grant:
+            break
+        case .takeOver(let reason):
+            takeOverReason = reason
+            NSLog("[OpenWearablesHealthSDK] Sync run lost the slot (%@) - taking over", reason)
         }
-        
+
         syncGeneration += 1
         isSyncing = true
         cancelRequestedAt = nil
+        leaseDeadlineStorage = current.addingTimeInterval(SyncLease.leaseDuration)
         let generation = syncGeneration
         syncLock.unlock()
-        
+
         // Fork: statistics for this run; a takeover is part of what the outcome reports.
-        registerRunStats(generation: generation).leaseTakenOver = takeOverStaleRun
-        
-        if takeOverStaleRun {
-            cancelInFlightSyncUploads(reason: "syncTakeover")
+        registerRunStats(generation: generation).leaseTakenOver = takeOverReason != nil
+
+        if let reason = takeOverReason {
+            // The old run is fenced by the generation compare in `isSyncCancelled`. Its
+            // in-flight uploads are cancelled so they do not hold the foreground session.
+            cancelInFlightSyncUploads(reason: reason == "leaseExpired" ? "leaseExpired" : "syncTakeover")
+            journalLeaseTakeover(reason: reason, previousGeneration: previousGeneration, newGeneration: generation, at: current)
         }
         return generation
+    }
+
+    /// Fork: a sign of life from the run that owns the slot. Pushes the lease out by
+    /// `SyncLease.leaseDuration`. A run that has already lost the slot extends nothing, so
+    /// a late callback of a superseded run cannot keep a newer run's slot alive.
+    internal func heartbeat(generation: Int) {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        guard isSyncing, generation == syncGeneration else { return }
+        leaseDeadlineStorage = now().addingTimeInterval(SyncLease.leaseDuration)
     }
     
     /// True once this run has been cancelled, or once a newer run has taken the slot.
@@ -1669,6 +1714,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         isSyncing = false
         isInitialSyncInProgress = false
         cancelRequestedAt = nil
+        leaseDeadlineStorage = nil
     }
     
     /// Returns the remaining background execution time when the app is in the
@@ -1736,7 +1782,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         syncLock.lock()
         cancelledGeneration = syncGeneration
-        cancelRequestedAt = Date()
+        // Fork: through the lease clock, so the lease decision compares like with like.
+        cancelRequestedAt = now()
         isInitialSyncInProgress = false
         syncLock.unlock()
         
