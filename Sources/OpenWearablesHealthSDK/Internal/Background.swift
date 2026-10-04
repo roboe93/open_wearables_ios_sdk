@@ -25,7 +25,7 @@ extension OpenWearablesHealthSDK {
                     return
                 }
 
-                self.triggerCombinedSync()
+                self.triggerCombinedSync(typeIdentifier: type.identifier)
                 completionHandler()
             }
             healthStore.execute(observer)
@@ -91,7 +91,9 @@ extension OpenWearablesHealthSDK {
             let group = DispatchGroup()
             group.enter()
             
-            self?.collectAllData(fullExport: false, isBackground: true) {
+            self?.collectAllData(
+                fullExport: false, isBackground: true, trigger: .sdkRefresh, deadline: nil
+            ) { _ in
                 group.leave()
             }
             
@@ -120,7 +122,9 @@ extension OpenWearablesHealthSDK {
             group.enter()
             
             self?.retryOutboxIfPossible()
-            self?.collectAllData(fullExport: false, isBackground: true) {
+            self?.collectAllData(
+                fullExport: false, isBackground: true, trigger: .sdkProcessing, deadline: nil
+            ) { _ in
                 group.leave()
             }
             

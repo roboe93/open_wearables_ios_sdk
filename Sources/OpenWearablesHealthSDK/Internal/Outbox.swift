@@ -1,6 +1,18 @@
 import Foundation
 import HealthKit
 
+/// Ausgang eines Uploads mit dem, was die Bool-Fassung verschweigt (Fork, Plan 05-03).
+internal enum UploadResult: Equatable {
+    /// 2xx, mit dem Status des Servers (202 beim Sync).
+    case accepted(Int)
+    /// 4xx außer 401: der Server lehnt die Daten ab, der Cursor bewegt sich nicht.
+    case rejected(Int)
+    /// Netz, Auth (401 nach Refresh), 5xx. Der Text enthält nie Gesundheitswerte.
+    case failed(String)
+    /// Der Lauf wurde abgebrochen oder verdrängt, oder die Hintergrundzeit hat den Upload beendet.
+    case cancelled
+}
+
 extension OpenWearablesHealthSDK {
 
     // MARK: - Outbox model
@@ -36,6 +48,8 @@ extension OpenWearablesHealthSDK {
         (200...299).contains(statusCode)
     }
     
+    /// Bool-Fassung von `uploadCombinedPayloadReportingStatus`. Bleibt bestehen, damit der
+    /// Aufrufvertrag von 0.15 gleich bleibt: `true` genau bei 2xx.
     internal func uploadCombinedPayload(
         payload: [String: Any],
         endpoint: URL,
@@ -43,9 +57,63 @@ extension OpenWearablesHealthSDK {
         generation: Int,
         completion: @escaping (Bool) -> Void
     ) {
+        uploadCombinedPayloadReportingStatus(
+            payload: payload, endpoint: endpoint, credential: credential, generation: generation
+        ) { result in
+            if case .accepted = result {
+                completion(true)
+            } else {
+                completion(false)
+            }
+        }
+    }
+
+    /// Trägt das Ergebnis in die Statistik der Generation ein und gibt es weiter.
+    /// Die Statistik beeinflusst keine Entscheidung, sie speist nur das `SyncOutcome`.
+    private func finishUpload(
+        _ result: UploadResult,
+        generation: Int,
+        completion: (UploadResult) -> Void
+    ) {
+        if let stats = runStats(for: generation) {
+            switch result {
+            case .accepted:
+                break
+            case .rejected(let httpStatus):
+                stats.recordRejected(httpStatus: httpStatus)
+            case .failed(let text):
+                stats.recordFailure(text)
+            case .cancelled:
+                stats.markCancelled()
+            }
+        }
+        completion(result)
+    }
+
+    /// Fehler des Transports als kurzer Text. Nur der Code, nie die Beschreibung (die kann
+    /// eine URL mit Pfad enthalten).
+    private func transportFailure(_ error: Error?) -> String {
+        guard let nsError = error as NSError? else { return "network" }
+        return "network(\(nsError.code))"
+    }
+
+    /// Ob ein Transportfehler die Antwort auf ein vom System beendetes Hintergrund-Budget ist.
+    private func isBackgroundExpirationCancel(_ error: Error?) -> Bool {
+        guard let nsError = error as NSError?,
+              nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled else { return false }
+        return cancellationAttribution() == "backgroundExpiration"
+    }
+
+    internal func uploadCombinedPayloadReportingStatus(
+        payload: [String: Any],
+        endpoint: URL,
+        credential: String,
+        generation: Int,
+        completion: @escaping (UploadResult) -> Void
+    ) {
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             self.logMessage("Failed to serialize payload")
-            completion(false)
+            finishUpload(.failed("serialize"), generation: generation, completion: completion)
             return
         }
         
@@ -66,25 +134,32 @@ extension OpenWearablesHealthSDK {
             )
             
             if self.isSyncCancelled(generation: generation) {
-                completion(false)
+                self.finishUpload(.cancelled, generation: generation, completion: completion)
                 return
             }
             
             if error != nil {
                 self.markNetworkError()
-                completion(false)
+                if self.isBackgroundExpirationCancel(error) {
+                    // Die Hintergrundzeit hat den Upload beendet, kein Netzfehler: der Lauf
+                    // ist `partial(backgroundTime)`, nicht `failed`.
+                    self.runStats(for: generation)?.markBudgetHit(.backgroundTime)
+                    self.finishUpload(.cancelled, generation: generation, completion: completion)
+                } else {
+                    self.finishUpload(.failed(self.transportFailure(error)), generation: generation, completion: completion)
+                }
                 return
             }
             
             guard let statusCode = statusCode else {
                 self.logMessage("No HTTP response")
                 self.markNetworkError()
-                completion(false)
+                self.finishUpload(.failed("no HTTP response"), generation: generation, completion: completion)
                 return
             }
             
             if OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: statusCode) {
-                completion(true)
+                self.finishUpload(.accepted(statusCode), generation: generation, completion: completion)
                 return
             }
             
@@ -93,9 +168,10 @@ extension OpenWearablesHealthSDK {
                     payloadData: payloadData,
                     endpoint: endpoint,
                     requestId: requestId,
-                    generation: generation,
-                    completion: completion
-                )
+                    generation: generation
+                ) { result in
+                    self.finishUpload(result, generation: generation, completion: completion)
+                }
                 return
             }
             
@@ -104,7 +180,11 @@ extension OpenWearablesHealthSDK {
                 self.logDiagnostic("HTTP \(statusCode) - \(truncated)")
             }
             
-            completion(false)
+            if (400...499).contains(statusCode) {
+                self.finishUpload(.rejected(statusCode), generation: generation, completion: completion)
+            } else {
+                self.finishUpload(.failed("HTTP \(statusCode)"), generation: generation, completion: completion)
+            }
         }
         
         trackSyncUpload(task, requestId: requestId)
@@ -118,12 +198,12 @@ extension OpenWearablesHealthSDK {
         endpoint: URL,
         requestId: String,
         generation: Int,
-        completion: @escaping (Bool) -> Void
+        completion: @escaping (UploadResult) -> Void
     ) {
         if isApiKeyAuth {
             self.logMessage("Got 401 with apiKey auth")
             self.emitAuthError(statusCode: 401)
-            completion(false)
+            completion(.failed("auth 401"))
             return
         }
         
@@ -133,7 +213,7 @@ extension OpenWearablesHealthSDK {
             guard let self = self else { return }
             
             if self.isSyncCancelled(generation: generation) {
-                completion(false)
+                completion(.cancelled)
                 return
             }
             
@@ -141,7 +221,7 @@ extension OpenWearablesHealthSDK {
             case .success:
                 guard let newCredential = self.authCredential else {
                     self.logMessage("Token refreshed but no credential available")
-                    completion(false)
+                    completion(.failed("auth: no credential"))
                     return
                 }
                 self.logMessage("Token refreshed, retrying...")
@@ -161,25 +241,40 @@ extension OpenWearablesHealthSDK {
                     )
                     
                     if self.isSyncCancelled(generation: generation) {
-                        completion(false)
+                        completion(.cancelled)
                         return
                     }
                     
                     if retryError != nil {
                         self.markNetworkError()
-                        completion(false)
+                        if self.isBackgroundExpirationCancel(retryError) {
+                            self.runStats(for: generation)?.markBudgetHit(.backgroundTime)
+                            completion(.cancelled)
+                        } else {
+                            completion(.failed(self.transportFailure(retryError)))
+                        }
                         return
                     }
                     
                     if let retryStatus = retryStatus, OpenWearablesHealthSDK.syncShouldAdvance(afterHTTPStatus: retryStatus) {
-                        completion(true)
+                        completion(.accepted(retryStatus))
                         return
                     }
                     
                     if let retryStatus = retryStatus, (401...403).contains(retryStatus) {
                         self.emitAuthError(statusCode: retryStatus)
                     }
-                    completion(false)
+                    
+                    switch retryStatus {
+                    case 401?:
+                        completion(.failed("auth 401"))
+                    case let status? where (400...499).contains(status):
+                        completion(.rejected(status))
+                    case let status?:
+                        completion(.failed("HTTP \(status)"))
+                    case nil:
+                        completion(.failed("no HTTP response"))
+                    }
                 }
                 
                 self.trackSyncUpload(retryTask, requestId: retryKey)
@@ -188,12 +283,12 @@ extension OpenWearablesHealthSDK {
             case .authFailure:
                 self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
-                completion(false)
+                completion(.failed("auth 401"))
                 
             case .networkError:
                 self.logMessage("Token refresh failed (network) - will retry later")
                 self.markNetworkError()
-                completion(false)
+                completion(.failed("network"))
             }
         }
     }
