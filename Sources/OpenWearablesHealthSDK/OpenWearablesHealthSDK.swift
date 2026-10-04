@@ -1600,7 +1600,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         captureAnchorStep(type: type, anchor: nil, limit: 10000, generation: generation, completion: completion)
     }
     
-    private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, generation: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
+    /// Fork (Plan 05-07): `internal` statt `private`, damit der HealthKit-Leser der Spuren den
+    /// Durchlauf für den Anchor "jetzt" nutzt. `onError` (Vorgabe `nil`) meldet den Fehler, der
+    /// `completion(nil)` auslöst, damit der Aufrufer "gesperrt" von "sonstiger Fehler" trennen
+    /// kann. Verhalten ohne `onError` unverändert.
+    internal func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, generation: Int, onError: ((Error) -> Void)? = nil, completion: @escaping (HKQueryAnchor?) -> Void) {
         // Fork: sign of life in every step of the recursion. A dense type needs many steps,
         // and the lease must not take over a run that is still reading.
         heartbeat(generation: generation)
@@ -1622,6 +1626,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 } else {
                     self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
                 }
+                onError?(error)
                 completion(nil)
                 return
             }
@@ -1630,7 +1635,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             // the recursion stop early with an anchor that wasn't fully advanced.
             let count = (samples?.count ?? 0) + (deletedObjects?.count ?? 0)
             if count >= limit {
-                self.captureAnchorStep(type: type, anchor: newAnchor, limit: limit, generation: generation, completion: completion)
+                self.captureAnchorStep(type: type, anchor: newAnchor, limit: limit, generation: generation, onError: onError, completion: completion)
             } else {
                 completion(newAnchor)
             }

@@ -240,8 +240,19 @@ extension OpenWearablesHealthSDK {
     /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
     /// It is bounded by the round size instead - background rounds carry 100 records
     /// (~65 KB), and the 2000-record rounds only run in the foreground.
+    ///
+    /// Fork (Plan 05-07), beide Zusätze additiv: Ohne sie entsteht dasselbe Paket wie zuvor.
+    /// - Parameter deleted: In Health gelöschte Messungen, als `data.deleted: [{"id", "type"}]`.
+    ///   Nur ein Aufrufer, der den Schalter `lanes.sendDeletions` geprüft hat, übergibt sie:
+    ///   Railway kennt das Feld nicht (Befund 5), ein leeres oder fehlendes ändert nichts.
+    /// - Parameter attribution: Herkunft des Pakets. Ohne Angabe gilt wie bisher die laufende
+    ///   `SyncState`-Sitzung (`currentSyncAttribution()`). Mit Angabe wird sie verwendet und die
+    ///   Sitzungsdatei nicht angefasst: ein Live-Paket trägt nie "historical" (Pitfall 7), ohne
+    ///   Sitzung fehlt `syncSessionId` ganz.
     internal func buildCombinedPayload(samples: [HKSample],
-                                       routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
+                                       routes: [UUID: [RouteFix]] = [:],
+                                       deleted: [DeletedRef] = [],
+                                       attribution: (sessionId: String?, syncType: String)? = nil) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -286,19 +297,28 @@ extension OpenWearablesHealthSDK {
             }
         }
         
+        var data: [String: Any] = [
+            "workouts": workouts,
+            "records": records,
+            "sleep": sleep
+        ]
+        if !deleted.isEmpty {
+            data["deleted"] = deleted.map { ["id": $0.id, "type": $0.type] }
+        }
         var payload: [String: Any] = [
             "provider": "apple",
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "syncTimestamp": dateFormatter.string(from: Date()),
-            "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
-            ]
+            "data": data
         ]
         // Backend already reads these (`body.get`); without them the batch is treated as
         // a session-less live upload and cannot be joined to the SyncRun the logs open.
-        if let attribution = currentSyncAttribution() {
+        if let attribution = attribution {
+            if let sessionId = attribution.sessionId, !sessionId.isEmpty {
+                payload["syncSessionId"] = sessionId
+            }
+            payload["syncType"] = attribution.syncType
+        } else if let attribution = currentSyncAttribution() {
             payload["syncSessionId"] = attribution.sessionId
             payload["syncType"] = attribution.syncType
         }
