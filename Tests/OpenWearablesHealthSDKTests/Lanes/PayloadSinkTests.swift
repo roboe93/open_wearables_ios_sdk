@@ -331,6 +331,56 @@ final class PayloadSinkTests: XCTestCase {
         }
     }
 
+    /// HI-02: Weist der Server ein Paket mit Löschungen ab (unbekanntes Feld `deleted`, eine Altlast),
+    /// geht es einmal ohne Löschungen erneut raus. Sonst würden gültige Samples halbiert und am Ende
+    /// geparkt, nur weil die Löschungen mitfuhren.
+    func testARejectedPackageWithDeletionsIsRetriedOnceWithoutThem() throws {
+        try withHarness { h in
+            try h.queue.enqueue([ref("alt")], sentAt: nil)
+            let lock = NSLock()
+            var calls = 0
+            StubURLProtocol.install { _ in
+                lock.lock()
+                calls += 1
+                let first = calls == 1
+                lock.unlock()
+                return first ? .status(422, #"{"detail":"deleted"}"#) : .status(202)
+            }
+
+            let result = deliver(h.sink(sendDeletions: true), [weightSample(80)], deleted: [ref("neu")])
+
+            XCTAssertEqual(result, .accepted(sentDeleted: false), "die Löschungen gingen nicht durch")
+            let bodies = sentBodies()
+            XCTAssertEqual(bodies.count, 2)
+            XCTAssertEqual(deletedIds(bodies[0]), ["neu", "alt"])
+            XCTAssertNil(dataSection(bodies[1])["deleted"], "die Wiederholung kommt ohne Löschungen")
+            XCTAssertEqual((dataSection(bodies[1])["records"] as? [Any])?.count, 1)
+            XCTAssertEqual(h.queue.stats().unsent, 1, "die Altlast bleibt ungesendet in der Warteschlange")
+        }
+    }
+
+    func testARejectionThatAlsoHitsThePackageWithoutDeletionsStaysRejected() throws {
+        try withHarness { h in
+            StubURLProtocol.install { _ in .status(422) }
+
+            let result = deliver(h.sink(sendDeletions: true), [weightSample(80)], deleted: [ref("neu")])
+
+            XCTAssertEqual(result, .rejected(httpStatus: 422))
+            XCTAssertEqual(sentBodies().count, 2, "genau eine Wiederholung")
+        }
+    }
+
+    func testARejectedPackageWithoutDeletionsIsNotRetried() throws {
+        try withHarness { h in
+            StubURLProtocol.install { _ in .status(422) }
+
+            let result = deliver(h.sink(sendDeletions: false), [weightSample(80)], deleted: [ref("neu")])
+
+            XCTAssertEqual(result, .rejected(httpStatus: 422))
+            XCTAssertEqual(sentBodies().count, 1)
+        }
+    }
+
     func testA503IsFailedAndNothingIsMarked() throws {
         try withHarness { h in
             try h.queue.enqueue([ref("alt")], sentAt: nil)

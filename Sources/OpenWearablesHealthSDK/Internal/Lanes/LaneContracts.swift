@@ -55,7 +55,9 @@ struct WindowChunk<Item> {
 enum DeliveryResult: Equatable {
     /// Der Server hat mit 2xx angenommen. `sentDeleted`: die Löschungen waren Teil des Pakets.
     case accepted(sentDeleted: Bool)
-    /// Der Server hat abgewiesen (4xx außer 401). Nichts darf festgeschrieben werden.
+    /// Der Server hat abgewiesen (4xx außer 401). Nichts darf festgeschrieben werden. Nur 400, 413
+    /// und 422 gelten dem Kern als Urteil über den Datensatz (`RejectionPolicy.isRecordSpecific`),
+    /// alle anderen behandelt er wie einen Serverfehler.
     case rejected(httpStatus: Int)
     /// Auth, Netz, 5xx. Der Text enthält nie Gesundheitswerte.
     case failed(String)

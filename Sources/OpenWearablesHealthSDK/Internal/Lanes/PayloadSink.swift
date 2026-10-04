@@ -110,25 +110,63 @@ final class PayloadSink: Delivering {
             let payload = sdk.buildCombinedPayload(
                 samples: samples, routes: routes, deleted: packageDeletions, attribution: attribution
             )
-            // Wie im Upstream-Pfad der frische Token: ein Refresh mitten im Zyklus gilt sofort.
-            let credential = sdk.authCredential ?? self.credential
 
-            sdk.uploadCombinedPayloadReportingStatus(
-                payload: payload, endpoint: self.endpoint, credential: credential, generation: self.generation
-            ) { [self] result in
+            self.upload(payload, sdk: sdk) { [self] result in
                 switch result {
                 case .accepted:
                     sdk.mirrorDedupe.commit(deduped.newKeys)
                     self.markSent(backlog, sdk: sdk)
                     completion(.accepted(sentDeleted: !packageDeletions.isEmpty))
-                case .rejected(let status):
-                    completion(.rejected(httpStatus: status))
-                case .failed(let text):
-                    completion(.failed(text))
-                case .cancelled:
-                    completion(.cancelled)
+                case .rejected(let status)
+                    where !packageDeletions.isEmpty && !samples.isEmpty && RejectionPolicy.isRecordSpecific(status):
+                    // Review HI-02: Der Server kann das Paket wegen der Löschungen abweisen (Feld
+                    // `deleted` unbekannt, eine Altlast). Dann gingen gültige Samples ins Halbieren und
+                    // am Ende ins Parken. Einmal ohne Löschungen wiederholen: wird das angenommen, sind
+                    // die Samples durch und die Löschungen bleiben ungesendet in der Warteschlange.
+                    sdk.logMessage("Package rejected (HTTP \(status)) with deletions - retrying once without them")
+                    let withoutDeletions = sdk.buildCombinedPayload(
+                        samples: samples, routes: routes, deleted: [], attribution: attribution
+                    )
+                    self.upload(withoutDeletions, sdk: sdk) { retry in
+                        switch retry {
+                        case .accepted:
+                            sdk.mirrorDedupe.commit(deduped.newKeys)
+                            completion(.accepted(sentDeleted: false))
+                        default:
+                            completion(Self.deliveryResult(retry))
+                        }
+                    }
+                default:
+                    completion(Self.deliveryResult(result))
                 }
             }
+        }
+    }
+
+    /// Lädt ein Paket über den Status-Upload aus `Outbox.swift` hoch.
+    private func upload(
+        _ payload: [String: Any], sdk: OpenWearablesHealthSDK,
+        completion: @escaping (UploadResult) -> Void
+    ) {
+        // Wie im Upstream-Pfad der frische Token: ein Refresh mitten im Zyklus gilt sofort.
+        let credential = sdk.authCredential ?? self.credential
+        sdk.uploadCombinedPayloadReportingStatus(
+            payload: payload, endpoint: endpoint, credential: credential, generation: generation,
+            completion: completion
+        )
+    }
+
+    /// Ein Upload-Ergebnis ohne Annahme als Lieferergebnis.
+    private static func deliveryResult(_ result: UploadResult) -> DeliveryResult {
+        switch result {
+        case .accepted:
+            return .accepted(sentDeleted: false)
+        case .rejected(let status):
+            return .rejected(httpStatus: status)
+        case .failed(let text):
+            return .failed(text)
+        case .cancelled:
+            return .cancelled
         }
     }
 

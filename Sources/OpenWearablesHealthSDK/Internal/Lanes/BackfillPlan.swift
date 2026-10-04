@@ -107,6 +107,7 @@ struct RejectionState: Codable, Equatable {
     var consecutive: Int
     var limit: Int
     var lastStatus: Int
+    var lastCountedAt: Date? = nil
 }
 
 struct BackfillPlan: Codable, Equatable {

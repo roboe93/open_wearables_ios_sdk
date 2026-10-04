@@ -603,6 +603,12 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
                     }
                     done(refetch)
 
+                case .rejected(let status) where !RejectionPolicy.isRecordSpecific(status):
+                    // 403, 404, 429 und Co.: kein Urteil über den Datensatz (HI-02). Wie ein Serverfehler:
+                    // nichts halbieren, nichts zählen, nichts parken, der Anchor bleibt.
+                    refuse(run, httpStatus: status)
+                    done([])
+
                 case .rejected(let status):
                     if package.count > 1 {
                         // Ein Sammelpaket weist ein Typ allein ab: je Typ getrennt erneut senden, damit nur
@@ -654,6 +660,14 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         return true
     }
 
+    /// Eine Abweisung, die nicht am Datensatz hängt (`RejectionPolicy.isRecordSpecific` ist falsch):
+    /// der Zyklus endet als `failed("HTTP <Status>")`, wie bei einem Serverfehler.
+    private func refuse(_ run: CycleRun, httpStatus: Int) {
+        run.tally.events.append("refused:\(httpStatus)")
+        run.tally.setFailure("HTTP \(httpStatus)")
+        run.stop = .failed
+    }
+
     private func handleLiveRejection(
         _ run: CycleRun, _ chunk: LiveChunk<Item>, httpStatus: Int, done: @escaping (Set<String>) -> Void
     ) {
@@ -661,7 +675,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         let key = BackfillPlan.rejectionKey(typeId: typeId, lane: .live)
         let attempted = max(chunk.items.count, 1)
         let (state, action) = RejectionPolicy.decide(
-            state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: attempted
+            state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: attempted, now: clock.now()
         )
         savePlan(run) { $0.rejections[key] = state }
 
@@ -803,6 +817,10 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
                     clearRejection(run, typeId: typeId, lane: .backfill)
                     next()
 
+                case .rejected(let status) where !RejectionPolicy.isRecordSpecific(status):
+                    refuse(run, httpStatus: status)
+                    next()
+
                 case .rejected(let status):
                     handleBackfillRejection(run, typeId: typeId, fresh: fresh, hasMore: hasMore, httpStatus: status, next: next)
 
@@ -824,7 +842,8 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     ) {
         let key = BackfillPlan.rejectionKey(typeId: typeId, lane: .backfill)
         let (state, action) = RejectionPolicy.decide(
-            state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: max(fresh.count, 1)
+            state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: max(fresh.count, 1),
+            now: clock.now()
         )
         savePlan(run) { $0.rejections[key] = state }
 

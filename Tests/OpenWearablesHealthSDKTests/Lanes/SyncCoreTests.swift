@@ -472,7 +472,8 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertTrue(first.events.contains("hold:\(weight):422"))
         XCTAssertTrue(h.parking.parked.isEmpty)
 
-        // Zyklus 2: nur das Einzelsample, zweite Ablehnung.
+        // Zyklus 2, eine Stunde später: nur das Einzelsample, zweite Ablehnung.
+        h.clock.advance(RejectionPolicy.countSpacing)
         let before2 = h.sink.deliveries.count
         let second = h.run(context)
         XCTAssertEqual(h.sink.deliveries.dropFirst(before2).map { $0.ids }, [["w3"]], "der nächste Zyklus beginnt beim Einzelsample")
@@ -480,7 +481,9 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertTrue(h.parking.parked.isEmpty)
         XCTAssertEqual(h.cursors.anchor(for: weight), FakeReader.token(2))
 
-        // Zyklus 3: dritte Ablehnung in getrennten Zyklen, w3 wird geparkt, der Cursor rückt darüber hinaus.
+        // Zyklus 3: dritte Ablehnung in getrennten Zyklen über zwei Stunden, w3 wird geparkt, der Cursor
+        // rückt darüber hinaus.
+        h.clock.advance(RejectionPolicy.countSpacing)
         let before3 = h.sink.deliveries.count
         let third = h.run(context)
         XCTAssertEqual(h.parking.parked, [InMemoryParking.Parked(typeId: weight, itemId: "w3", httpStatus: 422, record: Data("w3".utf8))])
@@ -505,7 +508,9 @@ final class SyncCoreTests: XCTestCase {
         let context = h.context([weight])
 
         _ = h.run(context)
+        h.clock.advance(RejectionPolicy.countSpacing)
         _ = h.run(context)
+        h.clock.advance(RejectionPolicy.countSpacing)
         let third = h.run(context)
 
         XCTAssertTrue(h.parking.parked.isEmpty)
@@ -526,10 +531,12 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(first.status, .rejected(httpStatus: 400))
         XCTAssertTrue(first.backfillPending)
 
+        h.clock.advance(RejectionPolicy.countSpacing)
         let second = h.run(context)
         XCTAssertEqual(second.status, .rejected(httpStatus: 400))
         XCTAssertTrue(h.parking.parked.isEmpty)
 
+        h.clock.advance(RejectionPolicy.countSpacing)
         let third = h.run(context)
         XCTAssertEqual(h.parking.parked.map { $0.itemId }, ["s2"])
         XCTAssertEqual(h.sink.deliveries.suffix(2).map { $0.ids }, [["s2"], ["s1"]], "nach dem Parken läuft das Nachholen weiter")
@@ -853,6 +860,70 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertTrue(h.sink.deliveries.flatMap { $0.ids }.contains("w-old"))
         XCTAssertEqual(h.store.plan.entries[heartRate]?.state, .done)
         XCTAssertFalse(result.backfillPending)
+    }
+
+    // MARK: Abweisungen, die nicht am Datensatz hängen (Review HI-02)
+
+    /// 404 nach einem Deploy oder Serverumzug, 403, 429: kein Halbieren, keine Zählung, nie parken.
+    /// Der Zyklus endet wie bei einem Serverfehler, der Anchor bleibt stehen, über Stunden.
+    func testARefusalThatIsNotAboutTheRecordNeitherHalvesNorParksAndKeepsTheAnchor() {
+        for status in [403, 404, 409, 429] {
+            let h = LaneHarness()
+            h.presetAnchors([weight])
+            h.reader.insert(weight, id: "w1", endDate: ago(h, 20))
+            h.reader.insert(weight, id: "w2", endDate: ago(h, 10))
+            h.sink.rejectWhen(status: status) { _ in true }
+            let context = h.context([weight], chunkLimit: 4)
+
+            var results: [CycleResult] = []
+            for _ in 0..<4 {
+                results.append(h.run(context))
+                h.clock.advance(2 * RejectionPolicy.countSpacing)
+            }
+
+            XCTAssertEqual(results.map { $0.status }, Array(repeating: .failed("HTTP \(status)"), count: 4), "\(status)")
+            XCTAssertEqual(h.sink.deliveries.map { $0.count }, [2, 2, 2, 2], "kein Halbieren bei \(status)")
+            XCTAssertTrue(h.parking.parked.isEmpty, "nichts geparkt bei \(status)")
+            XCTAssertEqual(h.cursors.anchor(for: weight), FakeReader.token(0), "der Anchor bleibt bei \(status)")
+            XCTAssertTrue(h.store.plan.rejections.isEmpty, "keine Zählung bei \(status)")
+        }
+    }
+
+    func testARefusalThatIsNotAboutTheRecordStopsTheBackfillWithoutParking() {
+        let h = LaneHarness()
+        h.reader.insert(heartRate, id: "s1", endDate: ago(h, 3_600))
+        h.sink.rejectWhen(status: 404) { _ in true }
+        let context = h.context([heartRate], chunkLimit: 1)
+
+        for _ in 0..<4 {
+            let result = h.run(context)
+            XCTAssertEqual(result.status, .failed("HTTP 404"))
+            h.clock.advance(2 * RejectionPolicy.countSpacing)
+        }
+
+        XCTAssertTrue(h.parking.parked.isEmpty)
+        XCTAssertEqual(h.store.plan.entries[heartRate]?.state, .pending, "das Nachholen bleibt offen")
+        XCTAssertNil(h.store.plan.rejections["\(heartRate)@backfill"])
+    }
+
+    /// Drei Ablehnungen in Minuten (Vordergrund, Observer) parken nicht: gültige Daten wanderten
+    /// sonst bei einem kurzen Serverproblem nach `health_rejected/`.
+    func testThreeQuickRejectionsDoNotPark() {
+        let h = LaneHarness()
+        h.presetAnchors([weight])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        h.sink.rejectWhen(status: 422) { _ in true }
+        let context = h.context([weight])
+
+        for _ in 0..<5 {
+            let result = h.run(context)
+            XCTAssertEqual(result.status, .rejected(httpStatus: 422))
+            h.clock.advance(120)
+        }
+
+        XCTAssertTrue(h.parking.parked.isEmpty)
+        XCTAssertEqual(h.cursors.anchor(for: weight), FakeReader.token(0))
+        XCTAssertEqual(h.store.plan.rejections[weight]?.consecutive, 1)
     }
 }
 

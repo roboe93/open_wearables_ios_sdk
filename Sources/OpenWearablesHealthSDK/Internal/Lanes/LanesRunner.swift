@@ -408,7 +408,7 @@ enum LaneEventSummary {
     static let nameLimit = 12
 
     private static let backfillPrefixes = ["bootstrap:", "bootstrapFailed:", "noAnchor:", "backfillReadFailed:", "noProgress:"]
-    private static let rejectedPrefixes = ["split:", "halve:", "hold:", "parked:", "parkFailed:"]
+    private static let rejectedPrefixes = ["split:", "halve:", "hold:", "parked:", "parkFailed:", "refused:"]
 
     static func group(_ events: [String]) -> (backfill: [String], rejected: [String], other: [String]) {
         var backfill: [String] = []

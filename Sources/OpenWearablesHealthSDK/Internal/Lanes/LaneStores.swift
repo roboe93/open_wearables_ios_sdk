@@ -323,6 +323,61 @@ final class FileRejectionParking: RejectionParking {
         }
         try LaneFiles.writeAtomically(data, to: url)
     }
+
+    // MARK: Sichtbar und erneut sendbar (Review HI-02)
+
+    /// Unterordner für Datensätze, die nach dem erneuten Senden angenommen wurden. Verschoben,
+    /// nie gelöscht.
+    static let replayedFolder = "replayed"
+
+    /// Die geparkten Datensätze, die noch auf eine Annahme warten, nach Namen sortiert. Ohne den
+    /// Unterordner `replayed/`.
+    func parkedFiles() -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names.filter { $0.hasSuffix(".json") }.sorted().map { directory.appendingPathComponent($0) }
+    }
+
+    func parkedCount() -> Int {
+        parkedFiles().count
+    }
+
+    /// Das Paket eines geparkten Datensatzes, wie es beim Parken abgewiesen wurde. `nil`, wenn die
+    /// Datei keinen lesbaren Datensatz enthält (dann bleibt sie liegen).
+    func payload(of url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let record = object["record"] as? [String: Any] { return record }
+        if let base64 = object["recordBase64"] as? String,
+           let raw = Data(base64Encoded: base64),
+           let record = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
+            return record
+        }
+        return nil
+    }
+
+    /// Verschiebt einen angenommenen Datensatz nach `replayed/`. Ein vorhandener Name wird nie
+    /// überschrieben: es kommt ein Zähler dazu.
+    @discardableResult
+    func markReplayed(_ url: URL) throws -> URL {
+        lock.lock()
+        defer { lock.unlock() }
+        let folder = directory.appendingPathComponent(Self.replayedFolder, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: folder, withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        )
+        let base = url.deletingPathExtension().lastPathComponent
+        var target = folder.appendingPathComponent(url.lastPathComponent)
+        var counter = 1
+        while FileManager.default.fileExists(atPath: target.path) {
+            counter += 1
+            target = folder.appendingPathComponent("\(base)-\(counter).json")
+        }
+        try FileManager.default.moveItem(at: url, to: target)
+        return target
+    }
 }
 
 // MARK: - Schalter und Fabriken im SDK

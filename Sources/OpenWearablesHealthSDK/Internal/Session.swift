@@ -243,6 +243,8 @@ extension OpenWearablesHealthSDK {
         status["needsCatchUp"] = lanesNeedsCatchUp
         status["deletionsQueued"] = queue.total
         status["deletionsUnsent"] = queue.unsent
+        // Fork (review HI-02): parked records stay visible until they are sent again.
+        status["parkedRecords"] = makeRejectionParking().parkedCount()
         return status
     }
     
