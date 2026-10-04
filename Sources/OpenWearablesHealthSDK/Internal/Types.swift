@@ -67,9 +67,24 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case dietaryFatTotal
     case dietaryWater
     
+    // Running Dynamics (iOS 16.0+) — sensor-derived, not computable from distance/steps
+    case runningPower
+    case runningVerticalOscillation
+    case runningGroundContactTime
+
+    // Cycling (iOS 17.0+) — Bluetooth power meters and Apple Watch cycling workouts
+    case cyclingPower
+    case cyclingCadence
+    case cyclingSpeed
+    case cyclingFunctionalThresholdPower
+
     // Workout
     case workout
-    
+
+    // Workout Effort (iOS 18.0+ / watchOS 11.0+)
+    case workoutEffortScore
+    case estimatedWorkoutEffortScore
+
     // Aliases (alternative names for the same underlying type)
     case restingEnergy
     case bloodOxygen
@@ -164,66 +179,69 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .dietaryFatTotal)
         case .dietaryWater:
             return HKObjectType.quantityType(forIdentifier: .dietaryWater)
+        case .runningPower:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningPower)
+            }
+            return nil
+        case .runningVerticalOscillation:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation)
+            }
+            return nil
+        case .runningGroundContactTime:
+            if #available(iOS 16.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .runningGroundContactTime)
+            }
+            return nil
+        case .cyclingPower:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingPower)
+            }
+            return nil
+        case .cyclingCadence:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingCadence)
+            }
+            return nil
+        case .cyclingSpeed:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingSpeed)
+            }
+            return nil
+        case .cyclingFunctionalThresholdPower:
+            if #available(iOS 17.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .cyclingFunctionalThresholdPower)
+            }
+            return nil
         case .workout:
             return HKObjectType.workoutType()
+        case .workoutEffortScore:
+            if #available(iOS 18.0, watchOS 11.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+            }
+            return nil
+        case .estimatedWorkoutEffortScore:
+            if #available(iOS 18.0, watchOS 11.0, *) {
+                return HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore)
+            }
+            return nil
         }
     }
 }
 
 extension OpenWearablesHealthSDK {
 
-    // MARK: - Public API
-    internal func serialize(samples: [HKSample], type: HKSampleType,
-                            routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
-        var workouts: [[String: Any]] = []
-        var records: [[String: Any]] = []
-        var sleep: [[String: Any]] = []
-        let df = ISO8601DateFormatter()
+    // MARK: - Combined payload
 
-        for s in samples {
-            if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w, routes: routes))
-            } else if let q = s as? HKQuantitySample {
-                records.append(_mapQuantity(q))
-            } else if let c = s as? HKCategorySample {
-                if c.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
-                    sleep.append(_mapSleep(c))
-                } else {
-                    records.append(_mapCategory(c))
-                }
-            } else if let corr = s as? HKCorrelation {
-                records.append(contentsOf: _mapCorrelation(corr))
-            } else {
-                records.append([
-                    "id": s.uuid.uuidString,
-                    "type": s.sampleType.identifier,
-                    "startDate": df.string(from: s.startDate),
-                    "endDate": df.string(from: s.endDate),
-                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
-                    "source": _mapSource(s.sourceRevision, device: s.device),
-                    "value": NSNull(),
-                    "unit": NSNull(),
-                    "parentId": NSNull(),
-                    "metadata": _metadataDict(s.metadata)
-                ])
-            }
-        }
-
-        return [
-            "provider": "apple",
-            "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
-            "syncTimestamp": df.string(from: Date()),
-            "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
-            ]
-        ]
-    }
-    
-    // MARK: - Memory-efficient streaming serialization
-    internal func serializeCombinedStreaming(samples: [HKSample],
-                                             routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
+    /// Builds one combined sync payload from the samples collected in a round.
+    ///
+    /// Not a streaming serializer: the payload is accumulated as a dictionary tree and
+    /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
+    /// It is bounded by the round size instead - background rounds carry 100 records
+    /// (~65 KB), and the 2000-record rounds only run in the foreground.
+    internal func buildCombinedPayload(samples: [HKSample],
+                                       routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
@@ -268,7 +286,7 @@ extension OpenWearablesHealthSDK {
             }
         }
         
-        return [
+        var payload: [String: Any] = [
             "provider": "apple",
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "syncTimestamp": dateFormatter.string(from: Date()),
@@ -278,57 +296,15 @@ extension OpenWearablesHealthSDK {
                 "sleep": sleep
             ]
         ]
+        // Backend already reads these (`body.get`); without them the batch is treated as
+        // a session-less live upload and cannot be joined to the SyncRun the logs open.
+        if let attribution = currentSyncAttribution() {
+            payload["syncSessionId"] = attribution.sessionId
+            payload["syncType"] = attribution.syncType
+        }
+        return payload
     }
     
-    // MARK: - Combined serialization (legacy)
-    internal func serializeCombined(samples: [HKSample], anchors: [String: HKQueryAnchor],
-                                    routes: [UUID: [RouteFix]] = [:]) -> [String: Any] {
-        var workouts: [[String: Any]] = []
-        var records: [[String: Any]] = []
-        var sleep: [[String: Any]] = []
-        let df = ISO8601DateFormatter()
-        
-        for s in samples {
-            if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w, routes: routes))
-            } else if let q = s as? HKQuantitySample {
-                records.append(_mapQuantity(q))
-            } else if let c = s as? HKCategorySample {
-                if c.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
-                    sleep.append(_mapSleep(c))
-                } else {
-                    records.append(_mapCategory(c))
-                }
-            } else if let corr = s as? HKCorrelation {
-                records.append(contentsOf: _mapCorrelation(corr))
-            } else {
-                records.append([
-                    "id": s.uuid.uuidString,
-                    "type": s.sampleType.identifier,
-                    "startDate": df.string(from: s.startDate),
-                    "endDate": df.string(from: s.endDate),
-                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
-                    "source": _mapSource(s.sourceRevision, device: s.device),
-                    "value": NSNull(),
-                    "unit": NSNull(),
-                    "parentId": NSNull(),
-                    "metadata": _metadataDict(s.metadata)
-                ])
-            }
-        }
-        
-        return [
-            "provider": "apple",
-            "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
-            "syncTimestamp": df.string(from: Date()),
-            "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
-            ]
-        ]
-    }
-
     // MARK: - Type mapping
     
     internal func mapTypes(_ types: [HealthDataType]) -> [HKSampleType] {
@@ -338,157 +314,6 @@ extension OpenWearablesHealthSDK {
     /// Legacy mapping from raw strings - used for restoring persisted types from Keychain.
     internal func mapTypesFromStrings(_ names: [String]) -> [HKSampleType] {
         return names.compactMap { HealthDataType(rawValue: $0)?.toHKSampleType() }
-    }
-
-    // MARK: - Record mappers
-
-    private func _mapQuantity(_ q: HKQuantitySample) -> [String: Any] {
-        let df = ISO8601DateFormatter()
-        let (unit, unitOut) = _defaultUnit(for: q.quantityType)
-        
-        var value: Double
-        let finalUnit: String
-        
-        if q.quantity.is(compatibleWith: unit) {
-            value = q.quantity.doubleValue(for: unit)
-            finalUnit = unitOut
-        } else {
-            let fallbackUnit = _getFallbackUnit(for: q.quantityType)
-            value = q.quantity.doubleValue(for: fallbackUnit)
-            finalUnit = fallbackUnit.unitString
-        }
-
-        if q.quantityType.identifier == HKQuantityTypeIdentifier.oxygenSaturation.rawValue {
-            value *= 100
-        }
-
-        return [
-            "id": q.uuid.uuidString,
-            "type": q.quantityType.identifier,
-            "startDate": df.string(from: q.startDate),
-            "endDate": df.string(from: q.endDate),
-            "zoneOffset": _zoneOffsetString(metadata: q.metadata, date: q.startDate),
-            "source": _mapSource(q.sourceRevision, device: q.device),
-            "value": value,
-            "unit": finalUnit,
-            "parentId": NSNull(),
-            "metadata": _metadataDict(q.metadata)
-        ]
-    }
-
-    private func _mapCategory(_ c: HKCategorySample) -> [String: Any] {
-        let df = ISO8601DateFormatter()
-        return [
-            "id": c.uuid.uuidString,
-            "type": c.categoryType.identifier,
-            "startDate": df.string(from: c.startDate),
-            "endDate": df.string(from: c.endDate),
-            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
-            "source": _mapSource(c.sourceRevision, device: c.device),
-            "value": c.value,
-            "unit": NSNull(),
-            "parentId": NSNull(),
-            "metadata": _metadataDict(c.metadata)
-        ]
-    }
-
-    private func _mapSleep(_ c: HKCategorySample) -> [String: Any] {
-        let df = ISO8601DateFormatter()
-        return [
-            "id": c.uuid.uuidString,
-            "parentId": NSNull(),
-            "stage": _sleepStageString(c.value),
-            "startDate": df.string(from: c.startDate),
-            "endDate": df.string(from: c.endDate),
-            "zoneOffset": _zoneOffsetString(metadata: c.metadata, date: c.startDate),
-            "source": _mapSource(c.sourceRevision, device: c.device),
-            "values": NSNull(),
-            "metadata": NSNull()
-        ]
-    }
-
-    private func _mapCorrelation(_ corr: HKCorrelation) -> [[String: Any]] {
-        var records: [[String: Any]] = []
-        let df = ISO8601DateFormatter()
-        let source = _mapSource(corr.sourceRevision, device: corr.device)
-
-        for sample in corr.objects {
-            if let q = sample as? HKQuantitySample {
-                let (unit, unitOut) = _defaultUnit(for: q.quantityType)
-                let value = q.quantity.doubleValue(for: unit)
-                records.append([
-                    "id": q.uuid.uuidString,
-                    "type": q.quantityType.identifier,
-                    "startDate": df.string(from: q.startDate),
-                    "endDate": df.string(from: q.endDate),
-                    "zoneOffset": _zoneOffsetString(metadata: q.metadata, fallback: corr.metadata, date: q.startDate),
-                    "source": source,
-                    "value": value,
-                    "unit": unitOut,
-                    "parentId": NSNull(),
-                    "metadata": _metadataDict(q.metadata)
-                ])
-            }
-        }
-        return records
-    }
-
-    private func _mapWorkout(_ w: HKWorkout, routes: [UUID: [RouteFix]]) -> [String: Any] {
-        let df = ISO8601DateFormatter()
-        let stats = _buildWorkoutStats(w)
-        let route = _routePayload(for: w, routes: routes, dateFormatter: df)
-
-        return [
-            "id": w.uuid.uuidString,
-            "parentId": NSNull(),
-            "type": _workoutTypeString(w.workoutActivityType),
-            "startDate": df.string(from: w.startDate),
-            "endDate": df.string(from: w.endDate),
-            "zoneOffset": _zoneOffsetString(metadata: w.metadata, date: w.startDate),
-            "source": _mapSource(w.sourceRevision, device: w.device),
-            "title": NSNull(),
-            "notes": NSNull(),
-            "values": stats,
-            "segments": NSNull(),
-            "laps": NSNull(),
-            "route": route,
-            "samples": NSNull(),
-            "metadata": NSNull()
-        ]
-    }
-
-    // MARK: - Workout route
-
-    /// The workout's track, or `NSNull()` when there is none.
-    ///
-    /// Indoor workouts have no route, and that is not a gap to report — the
-    /// backend leaves the column null and says so on the detail page.
-    private func _routePayload(for workout: HKWorkout,
-                               routes: [UUID: [RouteFix]],
-                               dateFormatter: ISO8601DateFormatter) -> Any {
-        guard let fixes = routes[workout.uuid], !fixes.isEmpty else { return NSNull() }
-        return WorkoutRoute.payload(fixes, dateFormatter: dateFormatter)
-    }
-
-    // MARK: - Mirror detection
-
-    /// The measurement a sample describes, stripped of who wrote it.
-    ///
-    /// `nil` for anything the ledger has no opinion about — only quantity
-    /// samples describe a measurement that another app can mirror verbatim.
-    internal func measurementKey(for sample: HKSample) -> MeasurementKey? {
-        guard let q = sample as? HKQuantitySample else { return nil }
-
-        let (unit, _) = _defaultUnit(for: q.quantityType)
-        let effectiveUnit = q.quantity.is(compatibleWith: unit)
-            ? unit
-            : _getFallbackUnit(for: q.quantityType)
-        guard q.quantity.is(compatibleWith: effectiveUnit) else { return nil }
-
-        return MeasurementKey(type: q.quantityType.identifier,
-                              start: q.startDate,
-                              end: q.endDate,
-                              value: q.quantity.doubleValue(for: effectiveUnit))
     }
 
     // MARK: - Units / helpers
@@ -516,6 +341,35 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .bloodPressureDiastolic):
             return HKUnit.millimeterOfMercury()
         default:
+            if #available(iOS 16.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
+                    return .watt()
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) {
+                    return .meterUnit(with: .centi)
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningGroundContactTime) {
+                    return .secondUnit(with: .milli)
+                }
+            }
+            if #available(iOS 17.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingPower)
+                    || qt == HKObjectType.quantityType(forIdentifier: .cyclingFunctionalThresholdPower) {
+                    return .watt()
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingCadence) {
+                    return .count().unitDivided(by: .minute())
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingSpeed) {
+                    return .meter().unitDivided(by: .second())
+                }
+            }
+            if #available(iOS 18.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
+                    return .appleEffortScore()
+                }
+            }
             return .count()
         }
     }
@@ -586,6 +440,35 @@ extension OpenWearablesHealthSDK {
         case HKObjectType.quantityType(forIdentifier: .dietaryWater):
             return (.liter(), "L")
         default:
+            if #available(iOS 16.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .runningPower) {
+                    return (.watt(), "W")
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningVerticalOscillation) {
+                    return (.meterUnit(with: .centi), "cm")
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .runningGroundContactTime) {
+                    return (.secondUnit(with: .milli), "ms")
+                }
+            }
+            if #available(iOS 17.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingPower)
+                    || qt == HKObjectType.quantityType(forIdentifier: .cyclingFunctionalThresholdPower) {
+                    return (.watt(), "W")
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingCadence) {
+                    return (.count().unitDivided(by: .minute()), "count/min")
+                }
+                if qt == HKObjectType.quantityType(forIdentifier: .cyclingSpeed) {
+                    return (.meter().unitDivided(by: .second()), "m/s")
+                }
+            }
+            if #available(iOS 18.0, *) {
+                if qt == HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
+                    || qt == HKObjectType.quantityType(forIdentifier: .estimatedWorkoutEffortScore) {
+                    return (.appleEffortScore(), "appleEffortScore")
+                }
+            }
             return (.count(), "count")
         }
     }
@@ -787,13 +670,69 @@ extension OpenWearablesHealthSDK {
             "notes": NSNull(),
             "values": stats,
             "segments": NSNull(),
-            "laps": NSNull(),
+            "laps": _buildWorkoutLaps(w, dateFormatter: dateFormatter),
             "route": route,
             "samples": NSNull(),
             "metadata": NSNull()
         ]
     }
     
+    // MARK: - Workout route
+
+    private func _routePayload(for workout: HKWorkout,
+                               routes: [UUID: [RouteFix]],
+                               dateFormatter: ISO8601DateFormatter) -> Any {
+        guard let fixes = routes[workout.uuid], !fixes.isEmpty else { return NSNull() }
+        return WorkoutRoute.payload(fixes, dateFormatter: dateFormatter)
+    }
+
+    // MARK: - Mirror detection
+
+    internal func measurementKey(for sample: HKSample) -> MeasurementKey? {
+        guard let q = sample as? HKQuantitySample else { return nil }
+        let (unit, _) = _defaultUnit(for: q.quantityType)
+        let effectiveUnit = q.quantity.is(compatibleWith: unit)
+            ? unit
+            : _getFallbackUnit(for: q.quantityType)
+        guard q.quantity.is(compatibleWith: effectiveUnit) else { return nil }
+        return MeasurementKey(type: q.quantityType.identifier,
+                              start: q.startDate,
+                              end: q.endDate,
+                              value: q.quantity.doubleValue(for: effectiveUnit))
+    }
+
+    // MARK: - Workout laps / events
+
+    /// Maps HealthKit workout events (lap / segment / marker) into the payload `laps` array.
+    /// Returns `NSNull()` when the workout has none of those events.
+    internal func _buildWorkoutLaps(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> Any {
+        let events = w.workoutEvents ?? []
+        let laps: [[String: Any]] = events.compactMap { ev in
+            guard let type = _workoutEventTypeString(ev.type) else { return nil }
+            var lap: [String: Any] = [
+                "type": type,
+                "startDate": dateFormatter.string(from: ev.dateInterval.start),
+                "endDate": dateFormatter.string(from: ev.dateInterval.end),
+                "duration": ev.dateInterval.duration,
+                "metadata": _metadataDict(ev.metadata)
+            ]
+            if let length = ev.metadata?[HKMetadataKeyLapLength] as? HKQuantity {
+                lap["distanceM"] = length.doubleValue(for: .meter())
+            }
+            return lap
+        }
+        return laps.isEmpty ? NSNull() : laps
+    }
+
+    internal func _workoutEventTypeString(_ type: HKWorkoutEventType) -> String? {
+        switch type {
+        case .lap: return "lap"
+        case .segment: return "segment"
+        case .marker: return "marker"
+        default: return nil
+        }
+    }
+
     // MARK: - Workout stats builder (shared between mappers)
     
     private func _buildWorkoutStats(_ w: HKWorkout) -> [[String: Any]] {
@@ -866,6 +805,23 @@ extension OpenWearablesHealthSDK {
                let gctStats = w.statistics(for: gctType),
                let avg = gctStats.averageQuantity() {
                 stats.append(["type": "averageGroundContactTime", "value": avg.doubleValue(for: .secondUnit(with: .milli)), "unit": "ms"])
+            }
+            if #available(iOS 17.0, *) {
+                if let powerType = HKQuantityType.quantityType(forIdentifier: .cyclingPower),
+                   let powerStats = w.statistics(for: powerType),
+                   let avg = powerStats.averageQuantity() {
+                    stats.append(["type": "averageCyclingPower", "value": avg.doubleValue(for: .watt()), "unit": "W"])
+                }
+                if let cadenceType = HKQuantityType.quantityType(forIdentifier: .cyclingCadence),
+                   let cadenceStats = w.statistics(for: cadenceType),
+                   let avg = cadenceStats.averageQuantity() {
+                    stats.append(["type": "averageCyclingCadence", "value": avg.doubleValue(for: .count().unitDivided(by: .minute())), "unit": "count/min"])
+                }
+                if let speedType = HKQuantityType.quantityType(forIdentifier: .cyclingSpeed),
+                   let speedStats = w.statistics(for: speedType),
+                   let avg = speedStats.averageQuantity() {
+                    stats.append(["type": "averageCyclingSpeed", "value": avg.doubleValue(for: HKUnit.meter().unitDivided(by: .second())), "unit": "m/s"])
+                }
             }
         } else {
             if let energy = w.totalEnergyBurned {

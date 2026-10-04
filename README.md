@@ -84,19 +84,20 @@ sdk.requestAuthorization(types: [.steps, .heartRate, .sleep]) { granted in
     }
 }
 
-// Trigger immediate sync
-sdk.syncNow { }
-
 // Stop sync
 sdk.stopBackgroundSync()
 
-// Sign out
+// Sign out. Reports the disconnect to the backend, then clears all local state.
+// The report is best effort and never blocks or fails the sign out.
 sdk.signOut()
 ```
 
 ## AppDelegate Setup
 
-For background URL session support, add to your `AppDelegate`:
+Only needed when upgrading from a version before 0.14, so outbox items left on disk
+by the old upload path can finish draining on the background session. Sync uploads
+run on the foreground session and an interrupted round is rebuilt from HealthKit, so
+a fresh install never reaches this callback. Harmless to keep either way:
 
 ```swift
 func application(

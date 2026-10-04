@@ -33,7 +33,7 @@ final class WorkoutRouteSerializationTests: XCTestCase {
 
     func testRouteReachesTheUploadedWorkout() {
         let w = workout()
-        let payload = sdk.serializeCombinedStreaming(samples: [w], routes: [w.uuid: fixes(count: 3)])
+        let payload = sdk.buildCombinedPayload(samples: [w], routes: [w.uuid: fixes(count: 3)])
 
         guard let mapped = workoutPayload(payload) else { return XCTFail("kein Workout") }
         guard let route = mapped["route"] as? [[String: Any]] else { return XCTFail("keine Route") }
@@ -48,7 +48,7 @@ final class WorkoutRouteSerializationTests: XCTestCase {
 
     func testWorkoutWithoutRouteStaysNull() {
         let w = workout()
-        let payload = sdk.serializeCombinedStreaming(samples: [w], routes: [:])
+        let payload = sdk.buildCombinedPayload(samples: [w], routes: [:])
 
         guard let mapped = workoutPayload(payload) else { return XCTFail("kein Workout") }
         XCTAssertTrue(mapped["route"] is NSNull,
@@ -58,7 +58,7 @@ final class WorkoutRouteSerializationTests: XCTestCase {
     func testRouteOfAnotherWorkoutIsNotAttached() {
         let mine = workout()
         let other = workout()
-        let payload = sdk.serializeCombinedStreaming(samples: [mine],
+        let payload = sdk.buildCombinedPayload(samples: [mine],
                                                      routes: [other.uuid: fixes(count: 3)])
 
         guard let mapped = workoutPayload(payload) else { return XCTFail("kein Workout") }
@@ -67,7 +67,7 @@ final class WorkoutRouteSerializationTests: XCTestCase {
 
     func testPayloadWithRouteRemainsValidJSON() {
         let w = workout()
-        let payload = sdk.serializeCombinedStreaming(samples: [w], routes: [w.uuid: fixes(count: 500)])
+        let payload = sdk.buildCombinedPayload(samples: [w], routes: [w.uuid: fixes(count: 500)])
         XCTAssertTrue(JSONSerialization.isValidJSONObject(payload))
         XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: payload))
     }

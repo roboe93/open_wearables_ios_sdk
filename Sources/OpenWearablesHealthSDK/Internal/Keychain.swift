@@ -15,6 +15,7 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let baseUrlKey = "baseUrl"
     private static let hostKey = "host"
     private static let customSyncUrlKey = "customSyncUrl"
+    private static let customRefreshUrlKey = "customRefreshUrl"
     private static let syncActiveKey = "syncActive"
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
@@ -107,6 +108,22 @@ internal class OpenWearablesHealthSdkKeychain {
     static func getCustomSyncUrl() -> String? {
         return defaults.string(forKey: customSyncUrlKey)
     }
+
+    /// Optional override for the token-refresh endpoint. When unset, the SDK
+    /// refreshes against `{apiBaseUrl}/token/refresh`. Persisted in the shared
+    /// suite so a background refresh task (fresh process) can read it.
+    static func saveCustomRefreshUrl(_ url: String?) {
+        if let url = url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
+            defaults.set(url, forKey: customRefreshUrlKey)
+        } else {
+            defaults.removeObject(forKey: customRefreshUrlKey)
+        }
+        defaults.synchronize()
+    }
+
+    static func getCustomRefreshUrl() -> String? {
+        return defaults.string(forKey: customRefreshUrlKey)
+    }
     
     // MARK: - Sync Active State
     
@@ -161,15 +178,37 @@ internal class OpenWearablesHealthSdkKeychain {
         delete(key: apiKeyKey)
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
+        defaults.removeObject(forKey: customRefreshUrlKey)
         defaults.removeObject(forKey: syncActiveKey)
         defaults.removeObject(forKey: trackedTypesKey)
         defaults.removeObject(forKey: syncDaysBackKey)
         defaults.synchronize()
     }
     
+    // MARK: - Test Seam
+    
+    /// Replaces Keychain-backed storage with an in-memory store. Production leaves this
+    /// nil.
+    ///
+    /// An XCTest bundle runs inside `xctest`, which belongs to no keychain access group,
+    /// so every `SecItemAdd` there fails with `errSecMissingEntitlement` (-34018) and no
+    /// credential can be read back. Tests that need a signed-in SDK install a store here;
+    /// it also keeps a test run from touching the credentials on the real device.
+    internal static var volatileStore: [String: String]?
+    
+    private static let volatileStoreLock = NSLock()
+    
     // MARK: - Private Keychain Operations
     
     private static func save(key: String, value: String) {
+        volatileStoreLock.lock()
+        if volatileStore != nil {
+            volatileStore?[key] = value
+            volatileStoreLock.unlock()
+            return
+        }
+        volatileStoreLock.unlock()
+        
         guard let data = value.data(using: .utf8) else { return }
         
         delete(key: key)
@@ -189,6 +228,13 @@ internal class OpenWearablesHealthSdkKeychain {
     }
     
     private static func load(key: String) -> String? {
+        volatileStoreLock.lock()
+        if let volatileStore = volatileStore {
+            volatileStoreLock.unlock()
+            return volatileStore[key]
+        }
+        volatileStoreLock.unlock()
+        
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -210,6 +256,14 @@ internal class OpenWearablesHealthSdkKeychain {
     }
     
     private static func delete(key: String) {
+        volatileStoreLock.lock()
+        if volatileStore != nil {
+            volatileStore?[key] = nil
+            volatileStoreLock.unlock()
+            return
+        }
+        volatileStoreLock.unlock()
+        
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
