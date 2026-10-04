@@ -256,8 +256,13 @@ final class AdoptionTests: XCTestCase {
             XCTAssertEqual(anchorSnapshot(defaults), anchorsBefore, "Anchors bleiben byte-gleich")
             XCTAssertEqual(defaults.object(forKey: "fullDone.user.none") as? Bool, false,
                            "Der Wert unter user.none bleibt, wie er war")
-            XCTAssertEqual(directoryListing(stateDirectory), filesBefore,
-                           "Keine Datei entsteht oder verschwindet (state.json, Outbox)")
+            // Seit Plan 05-03 hält die Adoption sich zusätzlich im Journal fest. Das Journal ist
+            // die einzige neue Datei; state.json und Outbox bleiben unberührt.
+            let filesAfter = directoryListing(stateDirectory)
+            XCTAssertEqual(filesAfter.filter { !$0.hasPrefix("health_journal") }, filesBefore,
+                           "Keine Datei außer dem Journal entsteht oder verschwindet (state.json, Outbox)")
+            XCTAssertEqual(filesAfter.filter { $0.hasPrefix("health_journal") },
+                           ["health_journal", "health_journal/journal.json"])
         }
     }
 

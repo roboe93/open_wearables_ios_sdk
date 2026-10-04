@@ -235,6 +235,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var runStatsByGeneration: [Int: RunStats] = [:]
     internal let runStatsLock = NSLock()
     
+    // Fork: run and wake journal plus the device-state caches that feed it. The accessors
+    // live in `Lanes/RunJournal.swift`. `UIApplication` may only be read on the main
+    // queue, so runs on other threads read these caches instead.
+    internal var runJournalCache: RunJournal?
+    internal let runJournalLock = NSLock()
+    internal let stateCacheLock = NSLock()
+    internal var protectedDataAvailableValue: Bool?
+    internal var backgroundRefreshStatusValue: String?
+    internal var backgroundRefreshObserver: NSObjectProtocol?
+    
     // Outbox retry state
     internal var isRetryingOutbox = false
     internal let outboxRetryLock = NSLock()
@@ -246,6 +256,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // Protected data monitoring
     private var protectedDataObserver: NSObjectProtocol?
+    private var protectedDataUnavailableObserver: NSObjectProtocol?
     internal var pendingSyncAfterUnlock = false
     
     // Foreground monitoring (resume sync when app returns to foreground)
@@ -421,6 +432,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         // Fork: Altzustand übernehmen, bevor `autoRestoreSync` und die ersten Auslöser
         // `fullDone` lesen. Sonst eskaliert der erste Lauf nach dem Update zum Neu-Export.
         adoptLegacyStateIfNeeded()
+        
+        // Fork: Sperrzustand und Hintergrundaktualisierung lesen, einen Start im
+        // Hintergrund im Journal festhalten (Befund 10).
+        observeDeviceStateAndLaunch()
 
         if OpenWearablesHealthSdkKeychain.isSyncActive() && OpenWearablesHealthSdkKeychain.hasSession() && !trackedTypes.isEmpty {
             logMessage("Auto-restoring background sync...")
@@ -838,6 +853,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal func triggerCombinedSync(typeIdentifier: String? = nil) {
         if isInitialSyncInProgress {
             logMessage("Skipping - initial sync in progress")
+            // Fork: the wake itself is the measurement, even if the run is dropped.
+            journalWake(
+                trigger: SyncTrigger.observer(typeIdentifier).journalValue,
+                note: "skipped: initial sync in progress"
+            )
             return
         }
         
@@ -891,6 +911,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         completion: @escaping (SyncOutcome) -> Void
     ) {
         let started = Date()
+        let protectedStart = protectedDataAvailableCache
         
         guard let generation = beginSyncRun() else {
             logMessage("Sync in progress, skipping")
@@ -899,6 +920,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     status: .skippedBusy, orchestration: .upstream,
                     trigger: trigger, started: started, finished: Date()
                 ),
+                protectedStart: protectedStart,
                 completion: completion
             )
             return
@@ -933,7 +955,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 finished: Date()
             )
             finishSync(generation: generation)
-            deliverRun(outcome, completion: completion)
+            deliverRun(outcome, protectedStart: protectedStart, completion: completion)
         }
         
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -1045,9 +1067,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
-    /// Delivers the outcome of a run: `onRunCompleted` first, then `completion`, each
-    /// exactly once, on the main queue.
-    internal func deliverRun(_ outcome: SyncOutcome, completion: @escaping (SyncOutcome) -> Void) {
+    /// Delivers the outcome of a run: the journal entry first (so it is on disk before the
+    /// process can be suspended), then `onRunCompleted` and `completion`, each exactly once,
+    /// on the main queue.
+    internal func deliverRun(
+        _ outcome: SyncOutcome,
+        protectedStart: Bool?,
+        completion: @escaping (SyncOutcome) -> Void
+    ) {
+        journalRun(outcome, protectedStart: protectedStart)
         DispatchQueue.main.async {
             self.onRunCompleted?(outcome)
             completion(outcome)
@@ -1064,6 +1092,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let now = Date()
         deliverRun(
             SyncOutcome(status: status, orchestration: .upstream, trigger: trigger, started: now, finished: now),
+            protectedStart: protectedDataAvailableCache,
             completion: completion
         )
     }
@@ -1989,13 +2018,29 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal func startProtectedDataMonitoring() {
         guard protectedDataObserver == nil else { return }
         
+        // Fork: initial value for the lock-state cache, then keep it current. A run on a
+        // background thread cannot ask UIApplication itself.
+        refreshDeviceStateCaches()
+        protectedDataUnavailableObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.protectedDataAvailableCache = false
+        }
+        
         protectedDataObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataDidBecomeAvailableNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
+            self.protectedDataAvailableCache = true
             self.logMessage("Device unlocked - protected data available")
+            self.journalWake(
+                trigger: SyncTrigger.unlock.journalValue,
+                note: "pendingSync=\(self.pendingSyncAfterUnlock)"
+            )
             
             if self.pendingSyncAfterUnlock {
                 self.pendingSyncAfterUnlock = false
@@ -2027,6 +2072,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if let observer = protectedDataObserver {
             NotificationCenter.default.removeObserver(observer)
             protectedDataObserver = nil
+        }
+        if let observer = protectedDataUnavailableObserver {
+            NotificationCenter.default.removeObserver(observer)
+            protectedDataUnavailableObserver = nil
         }
         pendingSyncAfterUnlock = false
     }

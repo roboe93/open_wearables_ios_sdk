@@ -76,6 +76,8 @@ extension OpenWearablesHealthSDK {
 
         guard let count = adoptedAnchorCount else { return false }
         logMessage("Adopted legacy state: initial export marked done (\(count) anchors, no open export)")
+        // Außerhalb des Locks: das Journal schreibt eine Datei und hat einen eigenen.
+        runJournal.record(SyncJournalEntry(at: Date(), kind: JournalKind.adoption, note: "anchors=\(count)"))
         return true
     }
 

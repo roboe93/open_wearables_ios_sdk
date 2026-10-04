@@ -11,6 +11,8 @@ extension OpenWearablesHealthSDK {
         activeObserverQueries.removeAll()
 
         let observableTypes = getQueryableTypes()
+        let deliveryGroup = DispatchGroup()
+        let deliveryTally = DeliveryTally()
 
         for type in observableTypes {
             let observer = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completionHandler, error in
@@ -30,7 +32,19 @@ extension OpenWearablesHealthSDK {
             }
             healthStore.execute(observer)
             activeObserverQueries.append(observer)
-            healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { _, _ in }
+            // Fork: the answer per type is the proof that background delivery is active at
+            // all (Befund 10). One journal line for all types, not 52.
+            deliveryGroup.enter()
+            healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { [weak self] success, error in
+                let ok = success && error == nil
+                deliveryTally.record(shortName: self?.shortTypeName(type.identifier) ?? type.identifier, success: ok)
+                deliveryGroup.leave()
+            }
+        }
+        deliveryGroup.notify(queue: .global(qos: .utility)) { [weak self] in
+            self?.runJournal.record(SyncJournalEntry(
+                at: Date(), kind: JournalKind.delivery, note: deliveryTally.note
+            ))
         }
         logMessage("Background observers registered for \(observableTypes.count) types")
     }
@@ -84,6 +98,7 @@ extension OpenWearablesHealthSDK {
 
     @available(iOS 13.0, *)
     internal func handleAppRefresh(task: BGAppRefreshTask) {
+        journalWake(trigger: SyncTrigger.sdkRefresh.journalValue, note: nil)
         scheduleAppRefresh()
         
         let opQueue = OperationQueue()
@@ -114,6 +129,7 @@ extension OpenWearablesHealthSDK {
 
     @available(iOS 13.0, *)
     internal func handleProcessing(task: BGProcessingTask) {
+        journalWake(trigger: SyncTrigger.sdkProcessing.journalValue, note: nil)
         scheduleProcessing()
         
         let opQueue = OperationQueue()
