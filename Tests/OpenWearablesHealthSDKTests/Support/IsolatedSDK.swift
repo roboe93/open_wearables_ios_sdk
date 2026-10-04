@@ -17,8 +17,8 @@ extension XCTestCase {
         accessToken: String? = "access-1",
         refreshToken: String? = "refresh-1",
         host: String = "https://sync.example.test",
-        _ body: (OpenWearablesHealthSDK, URL) -> Void
-    ) {
+        _ body: (OpenWearablesHealthSDK, URL) throws -> Void
+    ) rethrows {
         let sdk = OpenWearablesHealthSDK.shared
 
         let previousStateDirectory = sdk.stateDirectoryOverride
@@ -62,7 +62,7 @@ extension XCTestCase {
         OpenWearablesHealthSdkKeychain.saveHost(host)
         OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(nil)
 
-        body(sdk, stateDirectory)
+        try body(sdk, stateDirectory)
     }
 
     /// Spins the main run loop until `condition` holds or `timeout` elapses, so the

@@ -15,7 +15,7 @@ extension XCTestCase {
     /// das Ledger testet, braucht eine eigene Naht; die Adoption berührt es nicht.
     ///
     /// Zusammen mit `withIsolatedSDK` nutzen, außen die Defaults, innen das SDK.
-    func withIsolatedDefaults(_ body: (UserDefaults) -> Void) {
+    func withIsolatedDefaults(_ body: (UserDefaults) throws -> Void) rethrows {
         let sdk = OpenWearablesHealthSDK.shared
         let previous = sdk.defaults
 
@@ -31,6 +31,6 @@ extension XCTestCase {
         }
 
         sdk.defaults = suite
-        body(suite)
+        try body(suite)
     }
 }

@@ -92,6 +92,8 @@ internal enum JournalKind {
     static let adoption = "adoption"
     static let delivery = "delivery"
     static let lease = "lease"
+    /// Löschwarteschlange: Kappen nach Alter oder Anzahl, beschädigte Datei beiseitegelegt (Plan 05-07).
+    static let deletions = "deletions"
 }
 
 /// Ring aus den jüngsten Einträgen, atomar in eine JSON-Datei geschrieben.

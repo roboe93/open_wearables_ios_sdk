@@ -1,0 +1,347 @@
+import XCTest
+@testable import OpenWearablesHealthSDK
+
+/// Die dauerhafte Löschwarteschlange (D-12, SYNC-12, Plan 05-07).
+final class DeletionQueueTests: XCTestCase {
+
+    private let weight = "HKQuantityTypeIdentifierBodyMass"
+    private let steps = "HKQuantityTypeIdentifierStepCount"
+    private let epoch = Date(timeIntervalSince1970: 1_790_000_000)
+    private let day: TimeInterval = 24 * 3600
+
+    private var directory: URL!
+    private var clock: ManualClock!
+    private var journal: RunJournal!
+    private var logged: [String] = []
+
+    override func setUp() {
+        super.setUp()
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ow-deletion-tests-\(UUID().uuidString)", isDirectory: true)
+        clock = ManualClock(epoch)
+        journal = RunJournal(directory: directory.appendingPathComponent("journal", isDirectory: true))
+        logged = []
+    }
+
+    override func tearDown() {
+        // Der Test-Ordner liegt im temporären Verzeichnis der Simulator-Instanz. Aufgeräumt wird
+        // der gesamte Ordner dieses Tests, nie etwas ausserhalb davon.
+        if let directory = directory, directory.path.contains("ow-deletion-tests-") {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        super.tearDown()
+    }
+
+    private func makeQueue(maxEntries: Int = 50_000, maxAge: TimeInterval = 90 * 24 * 3600) -> DeletionQueue {
+        DeletionQueue(
+            directory: directory.appendingPathComponent("health_deletions", isDirectory: true),
+            clock: clock, journal: journal,
+            log: { [unowned self] in self.logged.append($0) },
+            maxEntries: maxEntries, maxAge: maxAge
+        )
+    }
+
+    private var queueFile: URL {
+        directory.appendingPathComponent("health_deletions/queue.json")
+    }
+
+    private func ref(_ id: String, type: String? = nil) -> DeletedRef {
+        DeletedRef(id: id, type: type ?? weight)
+    }
+
+    private func fileJSON() throws -> [String: Any] {
+        let data = try Data(contentsOf: queueFile)
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    // MARK: Dauerhaftigkeit
+
+    func testEnqueueSurvivesANewInstanceOnTheSameDirectory() throws {
+        try makeQueue().enqueue([ref("a"), ref("b", type: steps)], sentAt: nil)
+
+        let reopened = makeQueue()
+        XCTAssertEqual(reopened.stats().total, 2)
+        XCTAssertEqual(reopened.stats().unsent, 2)
+        XCTAssertEqual(reopened.unsent(limit: 10), [ref("a"), ref("b", type: steps)])
+    }
+
+    func testTheFileHoldsOnlyIdsTypesAndTimes() throws {
+        try makeQueue().enqueue([ref("abc-1")], sentAt: nil)
+        try makeQueue().markSent(ids: ["abc-1"], at: epoch.addingTimeInterval(60))
+
+        let json = try fileJSON()
+        let entries = try XCTUnwrap(json["entries"] as? [[String: Any]])
+        XCTAssertEqual(entries.count, 1)
+        guard entries.count == 1 else { return }
+        XCTAssertEqual(Set(entries[0].keys), ["id", "type", "queuedAt", "sentAt"])
+        XCTAssertEqual(entries[0]["id"] as? String, "abc-1")
+        XCTAssertEqual(entries[0]["type"] as? String, weight)
+        XCTAssertNotNil(json["version"])
+    }
+
+    func testAnUnsentEntryHasNoSentAtKey() throws {
+        try makeQueue().enqueue([ref("only")], sentAt: nil)
+        let entries = try XCTUnwrap(try fileJSON()["entries"] as? [[String: Any]])
+        guard !entries.isEmpty else { return XCTFail("keine Einträge in der Datei") }
+        XCTAssertNil(entries[0]["sentAt"], "Der Auswerter aus 05-02 zählt ein fehlendes sentAt als ungesendet")
+    }
+
+    func testEnqueueingNothingWritesNothing() throws {
+        try makeQueue().enqueue([], sentAt: nil)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: queueFile.path))
+    }
+
+    // MARK: Doppelte Kennungen
+
+    func testTheSameIdTwiceIsOneEntryAndKeepsTheEarliestQueuedAt() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("dup")], sentAt: nil)
+        clock.advance(3600)
+        try queue.enqueue([ref("dup")], sentAt: nil)
+
+        XCTAssertEqual(queue.stats().total, 1)
+        let entries = try XCTUnwrap(try fileJSON()["entries"] as? [[String: Any]])
+        guard !entries.isEmpty else { return XCTFail("keine Einträge in der Datei") }
+        let queuedAt = try XCTUnwrap(entries[0]["queuedAt"] as? String)
+        XCTAssertEqual(LaneTime.date(from: queuedAt), epoch)
+    }
+
+    func testAnEntryIsMarkedSentWhenTheSecondEnqueueBringsASentAt() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("dup")], sentAt: nil)
+        XCTAssertEqual(queue.stats().unsent, 1)
+
+        clock.advance(60)
+        try queue.enqueue([ref("dup")], sentAt: clock.now())
+        XCTAssertEqual(queue.stats().total, 1)
+        XCTAssertEqual(queue.stats().unsent, 0)
+    }
+
+    func testAnAlreadySentEntryNeverBecomesUnsentAgain() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("dup")], sentAt: epoch)
+        try queue.enqueue([ref("dup")], sentAt: nil)
+        XCTAssertEqual(queue.stats().unsent, 0)
+    }
+
+    func testANewEntryWithASentAtIsStoredAsSent() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("done")], sentAt: epoch)
+        XCTAssertEqual(queue.stats().total, 1)
+        XCTAssertEqual(queue.stats().unsent, 0)
+        XCTAssertTrue(queue.unsent(limit: 10).isEmpty)
+    }
+
+    // MARK: Ungesendete
+
+    func testUnsentReturnsTheOldestFirstAndHonoursTheLimit() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("1")], sentAt: nil)
+        clock.advance(10)
+        try queue.enqueue([ref("2"), ref("3")], sentAt: nil)
+        clock.advance(10)
+        try queue.enqueue([ref("4")], sentAt: nil)
+
+        XCTAssertEqual(queue.unsent(limit: 3).map(\.id), ["1", "2", "3"])
+        XCTAssertEqual(queue.unsent(limit: 100).map(\.id), ["1", "2", "3", "4"])
+        XCTAssertEqual(queue.unsent(limit: 0), [])
+    }
+
+    func testMarkSentRemovesEntriesFromTheUnsentListButKeepsThem() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("1"), ref("2"), ref("3")], sentAt: nil)
+
+        clock.advance(5)
+        try queue.markSent(ids: ["1", "3", "unbekannt"], at: clock.now())
+
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["2"])
+        XCTAssertEqual(queue.stats().total, 3)
+        XCTAssertEqual(queue.stats().unsent, 1)
+    }
+
+    func testMarkSentDoesNotMoveAnEarlierSentAt() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("1")], sentAt: nil)
+        try queue.markSent(ids: ["1"], at: epoch.addingTimeInterval(100))
+        try queue.markSent(ids: ["1"], at: epoch.addingTimeInterval(900))
+
+        let entries = try XCTUnwrap(try fileJSON()["entries"] as? [[String: Any]])
+        guard !entries.isEmpty else { return XCTFail("keine Einträge in der Datei") }
+        let sentAt = try XCTUnwrap(entries[0]["sentAt"] as? String)
+        XCTAssertEqual(LaneTime.date(from: sentAt), epoch.addingTimeInterval(100))
+    }
+
+    // MARK: Deckel
+
+    func testTheCountCapKeepsTheYoungestAndReportsWhatItDropped() throws {
+        let queue = makeQueue(maxEntries: 5)
+        for index in 1...7 {
+            try queue.enqueue([ref("id-\(index)")], sentAt: nil)
+            clock.advance(10)
+        }
+
+        XCTAssertEqual(queue.stats().total, 5)
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["id-3", "id-4", "id-5", "id-6", "id-7"])
+
+        let capLines = logged.filter { $0.contains("Löschwarteschlange gekappt") }
+        XCTAssertEqual(capLines.count, 2, "jedes Kappen steht im Log, einmal je Schreiben")
+        XCTAssertTrue(capLines.allSatisfy { $0.contains("1 Einträge") && $0.contains("Anzahl") })
+
+        let entries = journal.entries().filter { $0.kind == "deletions" }
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.map(\.deletions), [1, 1])
+    }
+
+    func testOneWriteThatCapsSeveralEntriesReportsTheirNumber() throws {
+        let queue = makeQueue(maxEntries: 5)
+        try queue.enqueue((1...7).map { ref("id-\($0)") }, sentAt: nil)
+
+        XCTAssertEqual(queue.stats().total, 5)
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["id-3", "id-4", "id-5", "id-6", "id-7"])
+        let entry = try XCTUnwrap(journal.entries().first { $0.kind == "deletions" })
+        XCTAssertEqual(entry.deletions, 2)
+        XCTAssertTrue(logged.contains { $0.contains("Löschwarteschlange gekappt: 2 Einträge") })
+    }
+
+    func testTheAgeCapDropsEntriesOlderThanNinetyDays() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("alt")], sentAt: nil)
+
+        clock.advance(91 * day)
+        try queue.enqueue([ref("neu")], sentAt: nil)
+
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["neu"])
+        XCTAssertEqual(queue.stats().total, 1)
+        XCTAssertTrue(logged.contains { $0.contains("Löschwarteschlange gekappt: 1 Einträge") && $0.contains("Alter") })
+        let entry = try XCTUnwrap(journal.entries().first { $0.kind == "deletions" })
+        XCTAssertEqual(entry.deletions, 1)
+    }
+
+    func testAnEntryYoungerThanNinetyDaysStays() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("a")], sentAt: nil)
+        clock.advance(89 * day)
+        try queue.enqueue([ref("b")], sentAt: nil)
+
+        XCTAssertEqual(queue.stats().total, 2)
+        XCTAssertTrue(logged.filter { $0.contains("gekappt") }.isEmpty)
+        XCTAssertTrue(journal.entries().filter { $0.kind == "deletions" }.isEmpty)
+    }
+
+    func testTheCapAlsoAppliesWhenMarkingSent() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("alt")], sentAt: nil)
+        clock.advance(50 * day)
+        try queue.enqueue([ref("mitte")], sentAt: nil)
+        clock.advance(41 * day)
+        XCTAssertEqual(queue.stats().total, 2, "gekappt wird beim Schreiben, nicht beim Lesen")
+
+        try queue.markSent(ids: ["mitte"], at: clock.now())
+
+        XCTAssertEqual(queue.stats().total, 1)
+        XCTAssertTrue(queue.unsent(limit: 10).isEmpty)
+        XCTAssertTrue(logged.contains { $0.contains("Löschwarteschlange gekappt: 1 Einträge") })
+    }
+
+    func testMarkingNothingSentWritesNothingAndSoCapsNothing() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("alt")], sentAt: nil)
+        clock.advance(91 * day)
+
+        try queue.markSent(ids: ["gibt-es-nicht"], at: clock.now())
+        XCTAssertEqual(queue.stats().total, 1)
+        XCTAssertTrue(logged.filter { $0.contains("gekappt") }.isEmpty)
+    }
+
+    func testTheCapReportsHowManyOfTheDroppedWereStillUnsent() throws {
+        let queue = makeQueue(maxEntries: 2)
+        try queue.enqueue([ref("1")], sentAt: epoch)      // gesendet
+        try queue.enqueue([ref("2")], sentAt: nil)
+        try queue.enqueue([ref("3")], sentAt: nil)        // kappt "1" (gesendet, kein Verlust)
+        try queue.enqueue([ref("4")], sentAt: nil)        // kappt "2" (ungesendet)
+
+        let notes = journal.entries().filter { $0.kind == "deletions" }.compactMap(\.note)
+        XCTAssertEqual(notes.count, 2)
+        guard notes.count == 2 else { return }
+        XCTAssertTrue(notes[0].contains("unsent=0"), notes[0])
+        XCTAssertTrue(notes[1].contains("unsent=1"), notes[1])
+    }
+
+    func testTheDefaultCapsAreFiftyThousandEntriesAndNinetyDays() {
+        let queue = DeletionQueue(
+            directory: directory, clock: clock, journal: nil, log: { _ in }
+        )
+        XCTAssertEqual(queue.maxEntries, 50_000)
+        XCTAssertEqual(queue.maxAge, 90 * 24 * 3600)
+    }
+
+    // MARK: Beschädigte und nicht lesbare Datei
+
+    func testACorruptFileIsMovedAsideNotDeletedAndTheQueueStartsEmpty() throws {
+        let folder = queueFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let garbage = Data("das ist kein json {{{".utf8)
+        try garbage.write(to: queueFile)
+
+        let queue = makeQueue()
+        XCTAssertEqual(queue.stats().total, 0)
+        try queue.enqueue([ref("neu")], sentAt: nil)
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        let asides = names.filter { $0.hasPrefix("queue.json.corrupt-") }
+        XCTAssertEqual(asides.count, 1, "genau eine beiseitegelegte Datei, gefunden: \(names)")
+        guard let aside = asides.first else { return }
+        let asideData = try Data(contentsOf: folder.appendingPathComponent(aside))
+        XCTAssertEqual(asideData, garbage, "der Inhalt bleibt unverändert erhalten")
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["neu"])
+        XCTAssertTrue(logged.contains { $0.contains("beschädigt") })
+    }
+
+    func testTwoCorruptionsInTheSameSecondKeepBothFiles() throws {
+        let folder = queueFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        try Data("eins".utf8).write(to: queueFile)
+        _ = makeQueue().stats()
+        try Data("zwei".utf8).write(to: queueFile)
+        _ = makeQueue().stats()
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        XCTAssertEqual(names.filter { $0.hasPrefix("queue.json.corrupt-") }.count, 2, "\(names)")
+    }
+
+    /// Eine Datei, die da ist, sich aber nicht lesen lässt (Schutzklasse vor dem ersten Entsperren),
+    /// ist nicht beschädigt: sie wird weder umbenannt noch überschrieben, und `enqueue` meldet den
+    /// Fehler, damit der Kern den Anchor festhält.
+    func testAnUnreadableFileIsNeitherMovedNorOverwrittenAndEnqueueThrows() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("echt")], sentAt: nil)
+        let before = try Data(contentsOf: queueFile)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: queueFile.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: queueFile.path) }
+
+        XCTAssertThrowsError(try makeQueue().enqueue([ref("neu")], sentAt: nil))
+        XCTAssertThrowsError(try makeQueue().markSent(ids: ["echt"], at: epoch))
+        XCTAssertEqual(makeQueue().unsent(limit: 10), [], "unlesbar heisst: nichts zu senden, nie raten")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: queueFile.path)
+        XCTAssertEqual(try Data(contentsOf: queueFile), before, "die Datei blieb unverändert")
+        let names = try FileManager.default.contentsOfDirectory(atPath: queueFile.deletingLastPathComponent().path)
+        XCTAssertTrue(names.filter { $0.contains("corrupt") }.isEmpty, "\(names)")
+    }
+
+    func testAFileFromAFutureWriterWithExtraKeysStillLoads() throws {
+        let folder = queueFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let json = """
+        {"version": 1, "extra": true, "entries": [
+          {"id": "x1", "type": "\(weight)", "queuedAt": "2026-10-04T08:00:00.000Z", "zukunft": 1}
+        ]}
+        """
+        try Data(json.utf8).write(to: queueFile)
+
+        let queue = makeQueue()
+        XCTAssertEqual(queue.unsent(limit: 5).map(\.id), ["x1"])
+    }
+}
