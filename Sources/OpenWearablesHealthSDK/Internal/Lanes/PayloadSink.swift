@@ -73,6 +73,8 @@ final class PayloadSink: Delivering {
         // festgeschrieben: bis dahin gilt nichts als geliefert.
         let deduped = sdk.mirrorDedupe.filterMirrored(items) { sdk.measurementKey(for: $0) }
         let samples = deduped.kept
+        // Was nicht hinausgeht, zählt der Kern nicht als übertragen (Review ME-06).
+        let notSent = Self.countByType(items, minus: samples)
 
         // Ohne Schalter geht nichts von den Löschungen auf die Leitung. Der Kern schreibt sie
         // trotzdem in die Warteschlange.
@@ -80,7 +82,7 @@ final class PayloadSink: Delivering {
 
         guard !samples.isEmpty || !ownDeletions.isEmpty else {
             // Nichts, was ein Paket wert wäre (alles gespiegelt, oder nur Löschungen ohne Schalter).
-            completion(.accepted(sentDeleted: false))
+            completion(.accepted(sentDeleted: false, notSent: notSent))
             return
         }
 
@@ -116,7 +118,7 @@ final class PayloadSink: Delivering {
                 case .accepted:
                     sdk.mirrorDedupe.commit(deduped.newKeys)
                     self.markSent(backlog, sdk: sdk)
-                    completion(.accepted(sentDeleted: !packageDeletions.isEmpty))
+                    completion(.accepted(sentDeleted: !packageDeletions.isEmpty, notSent: notSent))
                 case .rejected(let status)
                     where !packageDeletions.isEmpty && !samples.isEmpty && RejectionPolicy.isRecordSpecific(status):
                     // Review HI-02: Der Server kann das Paket wegen der Löschungen abweisen (Feld
@@ -131,7 +133,7 @@ final class PayloadSink: Delivering {
                         switch retry {
                         case .accepted:
                             sdk.mirrorDedupe.commit(deduped.newKeys)
-                            completion(.accepted(sentDeleted: false))
+                            completion(.accepted(sentDeleted: false, notSent: notSent))
                         default:
                             completion(Self.deliveryResult(retry))
                         }
@@ -141,6 +143,14 @@ final class PayloadSink: Delivering {
                 }
             }
         }
+    }
+
+    /// Je HK-Identifier: wie viele aus `all` nicht in `kept` sind. Nur Einträge über null.
+    private static func countByType(_ all: [HKSample], minus kept: [HKSample]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for sample in all { counts[sample.sampleType.identifier, default: 0] += 1 }
+        for sample in kept { counts[sample.sampleType.identifier, default: 0] -= 1 }
+        return counts.filter { $0.value > 0 }
     }
 
     /// Lädt ein Paket über den Status-Upload aus `Outbox.swift` hoch.

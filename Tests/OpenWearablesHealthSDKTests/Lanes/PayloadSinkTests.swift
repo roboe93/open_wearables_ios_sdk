@@ -475,9 +475,10 @@ final class PayloadSinkTests: XCTestCase {
         try withHarness { h in
             StubURLProtocol.install { _ in .status(202) }
 
-            _ = deliver(h.sink(sendDeletions: false), [weightSample(108.955), weightSample(108.955)])
+            let result = deliver(h.sink(sendDeletions: false), [weightSample(108.955), weightSample(108.955)])
 
             XCTAssertEqual((dataSection(sentBodies()[0])["records"] as? [Any])?.count, 1)
+            XCTAssertEqual(result, .accepted(sentDeleted: false, notSent: [weight: 1]), "die Kopie ging nicht hinaus (ME-06)")
         }
     }
 
@@ -493,9 +494,10 @@ final class PayloadSinkTests: XCTestCase {
             XCTAssertEqual(deliver(sink, [weightSample(80)]), .accepted(sentDeleted: false))
             XCTAssertEqual(StubURLProtocol.requests.count, 1)
 
-            // Bestätigt: die Spiegelkopie einer anderen App geht nicht noch einmal hinaus.
+            // Bestätigt: die Spiegelkopie einer anderen App geht nicht noch einmal hinaus und zählt
+            // nicht als gesendet (ME-06).
             StubURLProtocol.install { _ in .status(202) }
-            XCTAssertEqual(deliver(sink, [weightSample(80)]), .accepted(sentDeleted: false))
+            XCTAssertEqual(deliver(sink, [weightSample(80)]), .accepted(sentDeleted: false, notSent: [weight: 1]))
             XCTAssertEqual(StubURLProtocol.requests.count, 0, "alles gespiegelt: kein Paket")
         }
     }
@@ -509,7 +511,7 @@ final class PayloadSinkTests: XCTestCase {
 
             let result = deliver(sink, [weightSample(80)])
 
-            XCTAssertEqual(result, .accepted(sentDeleted: false))
+            XCTAssertEqual(result, .accepted(sentDeleted: false, notSent: [weight: 1]), "nichts ging hinaus (ME-06)")
             XCTAssertEqual(StubURLProtocol.requests.count, 0)
         }
     }

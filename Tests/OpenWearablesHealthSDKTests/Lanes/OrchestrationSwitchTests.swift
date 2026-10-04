@@ -562,6 +562,45 @@ final class OrchestrationSwitchTests: XCTestCase {
         }
     }
 
+    // MARK: - Antworten an übergebene Auslöser zählen nicht doppelt (Review ME-06)
+
+    /// Die Antwort an einen übergebenen Auslöser trägt die Zahlen seiner Runde, die das Ergebnis des
+    /// Zyklus noch einmal enthält. Sie ist als `handedOver` gekennzeichnet, im Ergebnis und im Journal,
+    /// damit Ledger und Auswertung sie nicht dazuzählen.
+    func testTheAnswerToAHandedOverTriggerIsMarkedSoItsRecordsAreNotCountedTwice() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
+                var waiters: [(CycleResult) -> Void] = []
+                sdk.registerActiveLanesCycle(ActiveLanesCycle(generation: generation) { waiter in
+                    waiters.append(waiter)
+                    return true
+                })
+                defer {
+                    _ = sdk.releaseActiveLanesCycle(generation: generation)
+                    sdk.finishSync(generation: generation)
+                }
+
+                withTrackedTypes([HKQuantityType(.stepCount)], on: sdk) {
+                    var outcome: SyncOutcome?
+                    sdk.sync(trigger: .observer("HKQuantityTypeIdentifierStepCount")) { outcome = $0 }
+                    waiters.first?(result(.transferred, live: 2, perType: ["HKQuantityTypeIdentifierStepCount": 2]))
+
+                    XCTAssertTrue(waitUntil { outcome != nil })
+                    XCTAssertEqual(outcome?.scope, .handedOver)
+                    XCTAssertEqual(outcome?.records, 2, "die Zahlen der Runde bleiben lesbar")
+                    let run = sdk.journalEntries().last { $0.kind == "run" }
+                    XCTAssertEqual(run?.scope, "handedOver")
+                }
+            }
+        }
+    }
+
+    func testAnOutcomeOfAWholeRunIsScopedRun() {
+        let outcome = SyncOutcome(status: .upToDate, orchestration: .lanes, trigger: .unlock, started: Date(), finished: Date())
+        XCTAssertEqual(outcome.scope, .run)
+    }
+
     // MARK: - Ereignisse fürs Journal
 
     func testCoreEventsAreGroupedIntoOneEntryPerKindAndNeverFloodTheRing() {

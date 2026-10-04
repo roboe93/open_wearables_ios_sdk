@@ -45,6 +45,9 @@ public struct SyncJournalEntry: Codable, Equatable, Sendable {
     public var bgRefresh: String?
     public var durationMs: Int?
     public var note: String?
+    /// Bei `run`: `handedOver`, wenn der Eintrag die Antwort an einen übergebenen Auslöser ist. Seine
+    /// Zahlen stehen im `run`-Eintrag des Zyklus noch einmal (Review ME-06). Fehlt bei ganzen Läufen.
+    public var scope: String?
 
     public init(
         at: Date,
@@ -63,7 +66,8 @@ public struct SyncJournalEntry: Codable, Equatable, Sendable {
         leaseTakenOver: Bool? = nil,
         bgRefresh: String? = nil,
         durationMs: Int? = nil,
-        note: String? = nil
+        note: String? = nil,
+        scope: String? = nil
     ) {
         self.at = at
         self.kind = kind
@@ -82,6 +86,7 @@ public struct SyncJournalEntry: Codable, Equatable, Sendable {
         self.bgRefresh = bgRefresh
         self.durationMs = durationMs
         self.note = note
+        self.scope = scope
     }
 }
 
@@ -411,7 +416,8 @@ extension OpenWearablesHealthSDK {
             leaseTakenOver: outcome.leaseTakenOver,
             bgRefresh: backgroundRefreshStatusCache,
             durationMs: max(0, Int(outcome.finished.timeIntervalSince(outcome.started) * 1000)),
-            note: note
+            note: note,
+            scope: outcome.scope == .handedOver ? SyncOutcome.Scope.handedOver.rawValue : nil
         ))
     }
 }

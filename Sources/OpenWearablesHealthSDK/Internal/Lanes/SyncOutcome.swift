@@ -84,6 +84,17 @@ public struct SyncOutcome: Equatable, Sendable {
         case failed(String)
     }
 
+    /// Wofür die Zahlen eines Ergebnisses stehen (Review ME-06).
+    public enum Scope: String, Sendable {
+        /// Ein ganzer Lauf. Seine Zahlen sind die gültigen, und jeder Datensatz steht in genau einem
+        /// solchen Ergebnis.
+        case run
+        /// Die Antwort an einen Auslöser, der an einen laufenden Zyklus übergeben wurde. Die Zahlen
+        /// sind die der Runde, auf die er gewartet hat; sie stehen im Ergebnis des Zyklus (`run`)
+        /// noch einmal und dürfen nicht dazugezählt werden (Ledger, Summen im Journal).
+        case handedOver
+    }
+
     public enum PartialReason: String, Sendable {
         /// Datensatz-, Zeit- oder Fristbudget aufgebraucht.
         case budget
@@ -117,6 +128,8 @@ public struct SyncOutcome: Equatable, Sendable {
     public var trigger: SyncTrigger
     public var started: Date
     public var finished: Date
+    /// `.run` für einen ganzen Lauf, `.handedOver` für die Antwort an einen übergebenen Auslöser.
+    public var scope: Scope
 
     public init(
         status: Status,
@@ -130,7 +143,8 @@ public struct SyncOutcome: Equatable, Sendable {
         orchestration: SyncOrchestration,
         trigger: SyncTrigger,
         started: Date,
-        finished: Date
+        finished: Date,
+        scope: Scope = .run
     ) {
         self.status = status
         self.records = records
@@ -144,6 +158,7 @@ public struct SyncOutcome: Equatable, Sendable {
         self.trigger = trigger
         self.started = started
         self.finished = finished
+        self.scope = scope
     }
 
     /// Schreibweise im Journal: `transferred`, `upToDate`, `partial:<grund>`,

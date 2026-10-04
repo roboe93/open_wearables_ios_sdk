@@ -1094,6 +1094,35 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(result.status, .rejected(httpStatus: 422))
         XCTAssertEqual(served?.status, .rejected(httpStatus: 422), "die Runde meldet ihre eigene Abweisung")
     }
+
+    // MARK: Nur Gesendetes zählt (Review ME-06)
+
+    /// Sind alle Samples eines Pakets Spiegelkopien, geht nichts hinaus. Der Anchor rückt trotzdem
+    /// (sie sind erledigt), aber der Lauf heißt nicht "übertragen".
+    func testSamplesTheSinkDidNotSendAreNotCountedAsTransferred() {
+        let h = LaneHarness()
+        h.presetAnchors([weight])
+        h.reader.insert(weight, id: "w-mirror", endDate: ago(h, 10))
+        h.sink.responder = { [weight] _ in .accepted(sentDeleted: false, notSent: [weight: 1]) }
+
+        let result = h.run(h.context([weight]))
+
+        XCTAssertEqual(result.status, .upToDate)
+        XCTAssertEqual(result.records, 0)
+        XCTAssertNil(result.perType[weight])
+        XCTAssertNotNil(h.log.index(ofPrefix: "commit:\(weight)"), "erledigt ist erledigt: der Anchor rückt")
+    }
+
+    func testOnlyTheSentPartOfAMixedPackageCounts() {
+        let h = LaneHarness()
+        for i in 1...3 { h.reader.insert(heartRate, id: "hr-\(i)", endDate: ago(h, Double(i) * 600)) }
+        h.sink.responder = { [heartRate] _ in .accepted(sentDeleted: false, notSent: [heartRate: 1]) }
+
+        let result = h.run(h.context([heartRate]))
+
+        XCTAssertEqual(result.backfillRecords, 2)
+        XCTAssertEqual(result.perType[heartRate], 2)
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.

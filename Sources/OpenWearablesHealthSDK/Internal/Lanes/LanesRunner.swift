@@ -167,7 +167,10 @@ extension OpenWearablesHealthSDK {
             // Die Antwort auf diese Runde. Die Ereignisse stehen im Journal des Zyklus, nicht hier.
             updateLanesNeedsCatchUp(with: result)
             fireObserverCompletions()
-            let outcome = lanesOutcome(from: result, trigger: trigger, started: started, leaseTakenOver: false)
+            // Die Zahlen der Runde stehen im Ergebnis des Zyklus noch einmal (ME-06).
+            let outcome = lanesOutcome(
+                from: result, trigger: trigger, started: started, leaseTakenOver: false, scope: .handedOver
+            )
             deliverRun(outcome, protectedStart: protectedStart, completion: completion)
         }
         let accepted = active.requestLiveRound(respond)
@@ -362,7 +365,8 @@ extension OpenWearablesHealthSDK {
 
     /// Das Ergebnis eines Zyklus (oder einer Live-Runde darin) als `SyncOutcome`.
     internal func lanesOutcome(
-        from result: CycleResult, trigger: SyncTrigger, started: Date, leaseTakenOver: Bool
+        from result: CycleResult, trigger: SyncTrigger, started: Date, leaseTakenOver: Bool,
+        scope: SyncOutcome.Scope = .run
     ) -> SyncOutcome {
         SyncOutcome(
             status: result.status,
@@ -376,7 +380,8 @@ extension OpenWearablesHealthSDK {
             orchestration: .lanes,
             trigger: trigger,
             started: started,
-            finished: Date()
+            finished: Date(),
+            scope: scope
         )
     }
 

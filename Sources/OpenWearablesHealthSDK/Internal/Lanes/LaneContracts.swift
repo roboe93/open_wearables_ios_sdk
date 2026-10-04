@@ -54,7 +54,9 @@ struct WindowChunk<Item> {
 
 enum DeliveryResult: Equatable {
     /// Der Server hat mit 2xx angenommen. `sentDeleted`: die Löschungen waren Teil des Pakets.
-    case accepted(sentDeleted: Bool)
+    /// `notSent`: je HK-Identifier, wie viele der übergebenen Samples gar nicht hinausgingen
+    /// (Spiegelkopien, Review ME-06). Sie gelten als erledigt, zählen aber nicht als übertragen.
+    case accepted(sentDeleted: Bool, notSent: [String: Int] = [:])
     /// Der Server hat abgewiesen (4xx außer 401). Nichts darf festgeschrieben werden. Nur 400, 413
     /// und 422 gelten dem Kern als Urteil über den Datensatz (`RejectionPolicy.isRecordSpecific`),
     /// alle anderen behandelt er wie einen Serverfehler.

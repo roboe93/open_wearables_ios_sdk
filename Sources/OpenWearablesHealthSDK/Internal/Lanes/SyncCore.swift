@@ -647,9 +647,12 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             queue.async { [self] in
                 run.context.heartbeat()
                 switch result {
-                case .accepted(let sentDeleted):
+                case .accepted(let sentDeleted, let notSent):
                     // Bestätigt ist bestätigt, auch wenn der Lauf danach nichts mehr festschreiben darf.
-                    for chunk in package { count(run, typeId: chunk.typeId, records: chunk.items.count, lane: .live) }
+                    // Gezählt wird nur, was hinausging (ME-06): Spiegelkopien sind erledigt, nicht übertragen.
+                    for chunk in package {
+                        count(run, typeId: chunk.typeId, records: chunk.items.count - (notSent[chunk.typeId] ?? 0), lane: .live)
+                    }
                     var refetch = Set<String>()
                     for chunk in package {
                         let before = cursors.anchor(for: chunk.typeId)
@@ -868,8 +871,8 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             queue.async { [self] in
                 run.context.heartbeat()
                 switch result {
-                case .accepted:
-                    count(run, typeId: typeId, records: fresh.count, lane: .backfill)
+                case .accepted(_, let notSent):
+                    count(run, typeId: typeId, records: fresh.count - (notSent[typeId] ?? 0), lane: .backfill)
                     guard !run.context.isCancelled() else {
                         cancel(run)
                         next()
