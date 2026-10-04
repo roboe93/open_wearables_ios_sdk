@@ -112,6 +112,23 @@ protocol CursorStore: AnyObject {
 protocol BackfillStoring: AnyObject {
     func load() -> BackfillPlan
     func save(_ plan: BackfillPlan) throws
+    /// Liest den aktuellen Stand, wendet `mutate` darauf an und schreibt ihn, als ein Schritt.
+    /// Liefert den geschriebenen Plan. Ein Eintrag, den ein anderer Schreiber seit dem letzten
+    /// Laden angelegt hat, geht so nie verloren (Review HI-01, ME-04).
+    @discardableResult
+    func update(_ mutate: (inout BackfillPlan) throws -> Void) throws -> BackfillPlan
+}
+
+extension BackfillStoring {
+    /// Vorgabe für einfache Speicher (Tests): laden, ändern, speichern. `FileBackfillStore` macht
+    /// daraus einen Schritt unter einer prozessweiten Sperre.
+    @discardableResult
+    func update(_ mutate: (inout BackfillPlan) throws -> Void) throws -> BackfillPlan {
+        var plan = load()
+        try mutate(&plan)
+        try save(plan)
+        return plan
+    }
 }
 
 /// Warteschlange für Löschungen. Wird vor dem Anchor-Commit beschrieben, damit eine
@@ -138,6 +155,11 @@ struct CycleContext {
     /// Lebenszeichen an die Lease, an jeder Prüfstelle.
     let heartbeat: () -> Void
     let isProtectedDataAvailable: () -> Bool
+    /// Führt `write` nur aus, solange die Generation des Zyklus gültig ist, und prüft und schreibt
+    /// in einem Schritt: eine Übernahme kann sich nicht zwischen Prüfung und Schreiben schieben
+    /// (Review HI-01, T-05-20). `false`: der Zyklus hat seine Generation verloren, nichts geschrieben.
+    /// Jeder Schreibzugriff des Kerns auf Anchors und Nachholplan läuft hierüber.
+    let commitIfCurrent: (() throws -> Void) throws -> Bool
 }
 
 struct CycleResult: Equatable {

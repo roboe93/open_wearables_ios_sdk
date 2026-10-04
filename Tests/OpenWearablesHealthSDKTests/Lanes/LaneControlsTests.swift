@@ -322,6 +322,60 @@ final class LaneControlsTests: XCTestCase {
         }
     }
 
+    /// ME-04: Ein Typ, der schon nachholt, behält auch seinen Spiegel-Abgleich. Zurückgesetzt wird
+    /// nur, was wirklich neu vorgemerkt wurde; sonst gingen Spiegelkopien alter Messwerte doppelt raus.
+    func testRequestBackfillForATypeThatIsAlreadyCatchingUpKeepsItsMirrorKeys() {
+        let bodyMass = "HKQuantityTypeIdentifierBodyMass"
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                let previous = sdk.mirrorDedupe
+                sdk.mirrorDedupe = MirrorDedupeLedger(storage: MemoryLedgerStorage())
+                defer { sdk.mirrorDedupe = previous }
+                let moment = Date(timeIntervalSince1970: 1_790_000_000)
+                sdk.mirrorDedupe.commit([MeasurementKey(type: bodyMass, start: moment, end: moment, value: 80.1)])
+
+                var plan = BackfillPlan.empty()
+                plan.start(typeId: bodyMass, now: moment, daysBack: 14, origin: "bootstrap")
+                try? sdk.makeBackfillStore().save(plan)
+
+                withProtectedData(false, on: sdk) {
+                    withTrackedTypes([HKQuantityType(.bodyMass)], on: sdk) {
+                        XCTAssertTrue(sdk.requestBackfill(typeIdentifiers: [bodyMass]))
+                        XCTAssertEqual(sdk.mirrorDedupe.count, 1, "nichts neu vorgemerkt, nichts vergessen")
+                        XCTAssertTrue(waitUntil { !sdk.isSyncInProgress })
+                        spin(0.1)
+                    }
+                }
+            }
+        }
+    }
+
+    /// ME-04: Die App erfährt, was neu vorgemerkt wurde und was schon lief, statt eines bloßen `true`.
+    func testRequestBackfillTypesTellsNewlyQueuedFromAlreadyPendingAndIgnored() {
+        let steps = "HKQuantityTypeIdentifierStepCount"
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                var plan = BackfillPlan.empty()
+                plan.start(typeId: heartRate, now: Date(timeIntervalSince1970: 1_790_000_000), daysBack: 14, origin: "bootstrap")
+                try? sdk.makeBackfillStore().save(plan)
+
+                withProtectedData(false, on: sdk) {
+                    withTrackedTypes([HKQuantityType(.heartRate), HKQuantityType(.stepCount)], on: sdk) {
+                        let result = sdk.requestBackfillTypes([heartRate, steps, "HKQuantityTypeIdentifierNotTracked"])
+
+                        XCTAssertEqual(result.queued, [steps])
+                        XCTAssertEqual(result.alreadyPending, [heartRate])
+                        XCTAssertEqual(result.ignored, ["HKQuantityTypeIdentifierNotTracked"])
+                        XCTAssertFalse(result.failed)
+                        XCTAssertEqual(sdk.makeBackfillStore().load().entries[steps]?.origin, "request")
+                        XCTAssertTrue(waitUntil { !sdk.isSyncInProgress })
+                        spin(0.1)
+                    }
+                }
+            }
+        }
+    }
+
     func testRequestBackfillWithOnlyUnknownTypesDoesNothing() {
         withIsolatedDefaults { _ in
             withIsolatedSDK(orchestration: .lanes) { sdk, _ in

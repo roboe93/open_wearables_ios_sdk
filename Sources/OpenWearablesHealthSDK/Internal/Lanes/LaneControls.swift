@@ -130,6 +130,25 @@ extension OpenWearablesHealthSDK {
 
 // MARK: - Nachholen auf Anforderung
 
+/// Was `requestBackfillTypes` getan hat (Review ME-04). Nur HK-Identifier, nie Werte.
+public struct BackfillRequestResult: Equatable, Sendable {
+    /// Neu vorgemerkt: der Typ holt über das Sync-Fenster nach, sein Spiegel-Abgleich ist vergessen.
+    public let queued: [String]
+    /// Holte schon nach und behält seinen Stand. Hier hat sich nichts geändert.
+    public let alreadyPending: [String]
+    /// Nicht verfolgt oder unbekannt, ignoriert.
+    public let ignored: [String]
+    /// Nichts verändert: Modus upstream, oder der Plan ließ sich nicht speichern.
+    public let failed: Bool
+
+    public init(queued: [String], alreadyPending: [String], ignored: [String], failed: Bool) {
+        self.queued = queued
+        self.alreadyPending = alreadyPending
+        self.ignored = ignored
+        self.failed = failed
+    }
+}
+
 extension OpenWearablesHealthSDK {
 
     /// Holt Typen nach, ohne Anchors zurückzusetzen (Ersatz für den bisherigen Anchor-Reset der
@@ -140,49 +159,77 @@ extension OpenWearablesHealthSDK {
     /// `request`); ein Typ, der schon nachholt, behält seinen Stand. Unbekannte Identifier werden
     /// ignoriert. Die Anchors der Live-Spur bleiben unangetastet: neue Daten laufen wie immer zuerst.
     ///
-    /// Der Spiegel-Abgleich für Messwerte (`resetMirrorDedupe`) wird für diese Typen zurückgesetzt,
-    /// sonst gälte das erneute Senden eines Messwerts als Spiegelkopie und käme nie an.
-    ///
     /// - Returns: `true`, wenn mindestens ein Typ im Plan steht und ein Zyklus angestoßen wurde.
+    ///   Was davon neu ist, sagt `requestBackfillTypes`.
     @discardableResult
     public func requestBackfill(typeIdentifiers: [String]) -> Bool {
+        let result = requestBackfillTypes(typeIdentifiers)
+        return !result.failed && !(result.queued.isEmpty && result.alreadyPending.isEmpty)
+    }
+
+    /// Wie `requestBackfill`, mit Auskunft je Typ (Review ME-04).
+    ///
+    /// Der Eintrag wird als ein Schritt auf den Stand der Datei gesetzt (`FileBackfillStore.update`):
+    /// ein Zyklus, der gerade nachholt, überschreibt ihn nicht mehr, sondern übernimmt ihn noch im
+    /// selben Zyklus. Der Spiegel-Abgleich für Messwerte (`resetMirrorDedupe`) wird erst danach und
+    /// nur für die neu vorgemerkten Typen zurückgesetzt, sonst gälte das erneute Senden eines
+    /// Messwerts als Spiegelkopie und käme nie an. Ein Typ, der schon nachholte, behält ihn: an
+    /// seinem Nachholen ändert sich nichts.
+    public func requestBackfillTypes(_ typeIdentifiers: [String]) -> BackfillRequestResult {
         guard orchestration == .lanes else {
             logMessage("requestBackfill ignored: orchestration is upstream")
-            return false
+            return BackfillRequestResult(queued: [], alreadyPending: [], ignored: [], failed: true)
         }
         let known = Set(getQueryableTypes().map { $0.identifier })
         var identifiers: [String] = []
-        for identifier in typeIdentifiers where known.contains(identifier) && !identifiers.contains(identifier) {
-            identifiers.append(identifier)
+        var ignored: [String] = []
+        for identifier in typeIdentifiers {
+            if known.contains(identifier) {
+                if !identifiers.contains(identifier) { identifiers.append(identifier) }
+            } else if !ignored.contains(identifier) {
+                ignored.append(identifier)
+            }
         }
-        let ignored = typeIdentifiers.filter { !known.contains($0) }
         if !ignored.isEmpty {
             logMessage("requestBackfill: ignoring \(ignored.count) unknown type(s)")
         }
-        guard !identifiers.isEmpty else { return false }
-
-        let store = makeBackfillStore()
-        var plan = store.load()
-        let now = Date()
-        for identifier in identifiers {
-            plan.start(typeId: identifier, now: now, daysBack: lanesDaysBack(), origin: "request")
+        guard !identifiers.isEmpty else {
+            return BackfillRequestResult(queued: [], alreadyPending: [], ignored: ignored, failed: false)
         }
+
+        let now = Date()
+        let daysBack = lanesDaysBack()
+        var queued: [String] = []
+        var alreadyPending: [String] = []
         do {
-            try store.save(plan)
+            try makeBackfillStore().update { plan in
+                queued = []
+                alreadyPending = []
+                for identifier in identifiers {
+                    if plan.start(typeId: identifier, now: now, daysBack: daysBack, origin: "request") {
+                        queued.append(identifier)
+                    } else {
+                        alreadyPending.append(identifier)
+                    }
+                }
+            }
         } catch {
             // Nicht lesbar oder die Platte: nichts anfassen, der Aufrufer erfährt es.
             logMessage("requestBackfill: plan could not be saved")
-            return false
+            return BackfillRequestResult(queued: [], alreadyPending: [], ignored: ignored, failed: true)
         }
-        resetMirrorDedupe(forTypes: identifiers)
+        if !queued.isEmpty {
+            resetMirrorDedupe(forTypes: queued)
+        }
+        let events = queued.map { "request:\($0)" } + alreadyPending.map { "requestPending:\($0)" }
         runJournal.record(SyncJournalEntry(
             at: now, kind: "backfill", orchestration: "lanes",
-            note: LaneEventSummary.note(identifiers.map { "request:\($0)" }, shorten: { shortTypeName($0) })
+            note: LaneEventSummary.note(events, shorten: { shortTypeName($0) })
         ))
-        logMessage("requestBackfill: \(identifiers.count) type(s) queued")
+        logMessage("requestBackfill: \(queued.count) type(s) queued, \(alreadyPending.count) already pending")
 
         syncAll(fullExport: false, trigger: .app("backfill")) { _ in }
-        return true
+        return BackfillRequestResult(queued: queued, alreadyPending: alreadyPending, ignored: ignored, failed: false)
     }
 }
 

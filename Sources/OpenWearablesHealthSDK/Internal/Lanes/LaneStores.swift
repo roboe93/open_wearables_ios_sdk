@@ -115,30 +115,72 @@ final class DefaultsCursorStore: CursorStore {
 
 // MARK: - Nachholplan
 
+/// Eine Sperre je Datei für den ganzen Prozess (Review LO-07).
+///
+/// Zyklus, abgelöster Zyklus, `requestBackfill` und `getSyncStatus` bauen je eine eigene
+/// Speicher-Instanz. Eine Sperre je Instanz schützte deshalb nur vor sich selbst, und zwei
+/// Schreiber verloren gegenseitig Einträge. Rekursiv: ein Rückruf aus dem Schreibschritt (Log)
+/// darf denselben Speicher noch einmal anfassen.
+enum LaneFileLocks {
+    private static let guardLock = NSLock()
+    private static var locks: [String: NSRecursiveLock] = [:]
+
+    static func lock(for url: URL) -> NSRecursiveLock {
+        let key = url.standardizedFileURL.path
+        guardLock.lock()
+        defer { guardLock.unlock() }
+        if let existing = locks[key] { return existing }
+        let created = NSRecursiveLock()
+        locks[key] = created
+        return created
+    }
+}
+
 /// `health_lanes/backfill.json`. Schreibt und liest über `BackfillPlan.encoded()` und `decode(_:)`,
 /// nie über einen eigenen Encoder: nur so überleben Zeitpunkte unter einer Millisekunde den Weg
 /// über die Platte (05-06, Abweichung 1).
 ///
 /// Format (`scripts/proof/analyze_runs.py` liest es): `{ "version", "sessionId", "entries": { "<Typ>":
 /// { "state": "pending|done", "floor", "covered", ... } }, "rejections": { ... } }`.
+///
+/// Mehrere Schreiber (Review HI-01, ME-04): Wer ändern will, nimmt `update`. Es liest den Stand
+/// der Datei, wendet die Änderung an und schreibt, als ein Schritt unter der prozessweiten Sperre
+/// der Datei. Ein Eintrag, den ein anderer Schreiber angelegt hat, bleibt so immer erhalten.
+/// `save` ersetzt die Datei mit einem ganzen Plan und prüft dafür die Revision: hat sich die Datei
+/// seit dem letzten Lesen oder Schreiben dieser Instanz geändert, wirft es `.conflict`, statt den
+/// fremden Stand still zu überschreiben. Die Revision ist der Inhalt der Datei selbst; das Format
+/// bleibt unverändert, ein Rückweg auf 0.15.0-ow.2 liest die Datei wie bisher.
 final class FileBackfillStore: BackfillStoring {
 
     enum StoreError: Error, Equatable {
         /// Die Datei ist da, lässt sich aber nicht lesen. `save` ersetzt sie nicht durch einen
         /// Plan, der ihren Stand nicht kennt.
         case unreadable
+        /// Die Datei hat sich seit dem letzten `load` oder Schreiben dieser Instanz geändert.
+        case conflict
+    }
+
+    /// Was diese Instanz zuletzt in der Datei gesehen hat, die Revision für `save`.
+    private enum Baseline {
+        /// Nie geladen: `save` schreibt wie bisher, ohne Prüfung.
+        case unknown
+        /// Beim letzten Blick gab es keine Datei.
+        case missing
+        case content(Data)
     }
 
     let fileURL: URL
 
     private let clock: LaneClock
     private let log: (String) -> Void
-    private let lock = NSLock()
+    private let lock: NSRecursiveLock
+    private var baseline: Baseline = .unknown
 
     init(directory: URL, clock: LaneClock = SystemLaneClock(), log: @escaping (String) -> Void = { _ in }) {
         self.fileURL = directory.appendingPathComponent("backfill.json")
         self.clock = clock
         self.log = log
+        self.lock = LaneFileLocks.lock(for: directory.appendingPathComponent("backfill.json"))
     }
 
     /// Fehlende Datei: leerer Plan. Beschädigte Datei: beiseitegelegt, leerer Plan. Nicht lesbare
@@ -147,11 +189,18 @@ final class FileBackfillStore: BackfillStoring {
         lock.lock()
         defer { lock.unlock() }
         switch LaneFiles.read(fileURL) {
-        case .missing, .unreadable:
+        case .missing:
+            baseline = .missing
+            return .empty()
+        case .unreadable:
+            baseline = .unknown
             return .empty()
         case .data(let data):
-            if let plan = try? BackfillPlan.decode(data) { return plan }
-            moveCorruptAside()
+            if let plan = try? BackfillPlan.decode(data) {
+                baseline = .content(data)
+                return plan
+            }
+            baseline = moveCorruptAside() ? .missing : .unknown
             return .empty()
         }
     }
@@ -164,14 +213,58 @@ final class FileBackfillStore: BackfillStoring {
         case .unreadable:
             throw StoreError.unreadable
         case .data(let existing):
-            // Eine beschädigte Datei wird nie unbemerkt ersetzt, auch wenn niemand vorher geladen hat.
-            if (try? BackfillPlan.decode(existing)) == nil, !moveCorruptAside() {
-                throw StoreError.unreadable
+            if (try? BackfillPlan.decode(existing)) == nil {
+                // Eine beschädigte Datei wird nie unbemerkt ersetzt, auch wenn niemand vorher geladen hat.
+                if !moveCorruptAside() { throw StoreError.unreadable }
+            } else {
+                switch baseline {
+                case .unknown:
+                    break
+                case .missing:
+                    // Seit dem Laden hat ein anderer Schreiber die Datei angelegt.
+                    throw StoreError.conflict
+                case .content(let seen):
+                    if seen != existing { throw StoreError.conflict }
+                }
             }
         case .missing:
             break
         }
         try LaneFiles.writeAtomically(data, to: fileURL)
+        baseline = .content(data)
+    }
+
+    @discardableResult
+    func update(_ mutate: (inout BackfillPlan) throws -> Void) throws -> BackfillPlan {
+        lock.lock()
+        defer { lock.unlock() }
+        var plan: BackfillPlan
+        var existing: Data?
+        switch LaneFiles.read(fileURL) {
+        case .unreadable:
+            throw StoreError.unreadable
+        case .missing:
+            plan = .empty()
+        case .data(let data):
+            if let decoded = try? BackfillPlan.decode(data) {
+                plan = decoded
+                existing = data
+            } else {
+                if !moveCorruptAside() { throw StoreError.unreadable }
+                plan = .empty()
+            }
+        }
+        let before = plan
+        try mutate(&plan)
+        if plan == before {
+            // Nichts geändert, nichts geschrieben.
+            baseline = existing.map { .content($0) } ?? .missing
+            return plan
+        }
+        let data = try plan.encoded()
+        try LaneFiles.writeAtomically(data, to: fileURL)
+        baseline = .content(data)
+        return plan
     }
 
     @discardableResult

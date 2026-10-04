@@ -183,6 +183,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var cancelledGeneration: Int = 0
     private var cancelRequestedAt: Date?
 
+    /// Fork (review HI-01): held while a run checks its generation and writes (`commitIfCurrent`),
+    /// and while the generation changes (`beginSyncRun`, `cancelSync`). A takeover therefore
+    /// waits for a write that is already running, and a write after the takeover is refused:
+    /// check and write are one step, not a check followed by a write (TOCTOU). Recursive, so a
+    /// write that calls back into the SDK on the same thread cannot deadlock. Lock order: this
+    /// one before `syncLock`, never the other way round.
+    private let commitLock = NSRecursiveLock()
+
     // Fork: the sync slot has a lease. A run that gives no sign of life for
     // `SyncLease.leaseDuration` loses the slot to the next caller, also when nobody ever
     // cancelled it. The 60 s takeover after `cancelSync()` from 0.15 lives on in the
@@ -1696,6 +1704,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Claims the sync slot for a new run and returns its generation, or nil when
     /// another run still owns it.
     internal func beginSyncRun() -> Int? {
+        commitLock.lock()
         syncLock.lock()
 
         // Fork: the decision lives in `SyncLease` (a pure function). It keeps the rule of 0.15 (take
@@ -1711,6 +1720,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         ) {
         case .busy:
             syncLock.unlock()
+            commitLock.unlock()
             return nil
         case .grant:
             break
@@ -1725,6 +1735,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         leaseDeadlineStorage = current.addingTimeInterval(SyncLease.leaseDuration)
         let generation = syncGeneration
         syncLock.unlock()
+        commitLock.unlock()
 
         // Fork: statistics for this run; a takeover is part of what the outcome reports.
         registerRunStats(generation: generation).leaseTakenOver = takeOverReason != nil
@@ -1765,6 +1776,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncLock.lock()
         defer { syncLock.unlock() }
         return generation <= cancelledGeneration || generation != syncGeneration
+    }
+
+    /// Fork (review HI-01): runs `write` only while `generation` still owns the slot, and checks
+    /// and writes in one step under `commitLock`. Returns `false` without writing when the run
+    /// was cancelled or a newer run took the slot. `write` must stay short (a small file, a
+    /// defaults key): a takeover waits for it.
+    internal func commitIfCurrent(generation: Int, _ write: () throws -> Void) rethrows -> Bool {
+        commitLock.lock()
+        defer { commitLock.unlock() }
+        guard !isSyncCancelled(generation: generation) else { return false }
+        try write()
+        return true
     }
     
     /// Releases the sync slot. A run that has already lost the slot to a newer one
@@ -1844,12 +1867,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal func cancelSync() {
         logMessage("Cancelling sync...")
         
+        // Fork (review HI-01): a write of the run that is being cancelled finishes first.
+        commitLock.lock()
         syncLock.lock()
         cancelledGeneration = syncGeneration
         // Fork: through the lease clock, so the lease decision compares like with like.
         cancelRequestedAt = now()
         isInitialSyncInProgress = false
         syncLock.unlock()
+        commitLock.unlock()
         
         pendingSyncWorkItem?.cancel()
         pendingSyncWorkItem = nil

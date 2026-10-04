@@ -386,22 +386,35 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
                     // "Jetzt" wird nach dem Lesen des Anchors bestimmt: alles, was vorher entstand, liegt
                     // im Fenster des Nachholens, alles danach kommt über den Anchor.
                     let now = clock.now()
-                    var plan = run.plan
-                    if let entry = plan.entries[typeId], entry.state == .pending {
-                        plan.reanchor(typeId: typeId, now: now)
-                    } else {
-                        plan.start(typeId: typeId, now: now, daysBack: run.context.daysBack, origin: Self.bootstrapOrigin)
-                    }
-                    do {
-                        try backfill.save(plan)
-                    } catch {
+                    let daysBack = run.context.daysBack
+                    // Plan und Anchor nur mit gültiger Generation (HI-01): ein Zyklus, der während des
+                    // Durchlaufs abgelöst wurde, überschriebe sonst den Plan des neueren und hinterließe
+                    // einen Anchor ohne Nachholeintrag.
+                    switch writePlan(run, { plan in
+                        if let entry = plan.entries[typeId], entry.state == .pending {
+                            plan.reanchor(typeId: typeId, now: now)
+                        } else {
+                            plan.start(typeId: typeId, now: now, daysBack: daysBack, origin: Self.bootstrapOrigin)
+                        }
+                    }) {
+                    case .fenced:
+                        cancel(run)
+                        done()
+                        return
+                    case .failed:
                         run.tally.events.append("bootstrapFailed:\(typeId)")
                         run.tally.setFailure("bootstrap")
                         next()
                         return
+                    case .written:
+                        break
                     }
-                    run.plan = plan
-                    cursors.commit(anchor, for: typeId)
+                    guard commitAnchor(run, anchor, for: typeId) else {
+                        // Der Plan steht, der Anchor nicht: der nächste Zyklus verankert neu (`reanchor`).
+                        cancel(run)
+                        done()
+                        return
+                    }
                     run.context.heartbeat()
                     run.tally.events.append("bootstrap:\(typeId)")
                     next()
@@ -502,9 +515,12 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
                     if chunk.items.isEmpty && chunk.deleted.isEmpty {
                         // Nichts zu liefern. Ein weitergerückter Anchor (HealthKit hat nur Fremdes
                         // übersprungen) wird festgehalten, damit er nicht erneut gelesen wird.
-                        if chunk.newAnchor != anchor && !run.context.isCancelled() {
-                            cursors.commit(chunk.newAnchor, for: typeId)
-                            run.context.heartbeat()
+                        if chunk.newAnchor != anchor {
+                            if commitAnchor(run, chunk.newAnchor, for: typeId) {
+                                run.context.heartbeat()
+                            } else {
+                                cancel(run)
+                            }
                         }
                         fetchPass(run, types: types, index: index + 1, collected: collected, done: done)
                     } else {
@@ -629,11 +645,10 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             }
             run.tally.deletionsQueued += chunk.deleted.count
         }
-        if run.context.isCancelled() {
+        guard commitAnchor(run, chunk.newAnchor, for: chunk.typeId) else {
             cancel(run)
             return false
         }
-        cursors.commit(chunk.newAnchor, for: chunk.typeId)
         run.context.heartbeat()
         clearRejection(run, typeId: chunk.typeId, lane: .live)
         return true
@@ -648,8 +663,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         let (state, action) = RejectionPolicy.decide(
             state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: attempted
         )
-        run.plan.rejections[key] = state
-        savePlan(run)
+        savePlan(run) { $0.rejections[key] = state }
 
         switch action {
         case .halve(let limit):
@@ -716,11 +730,14 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             return
         }
 
-        let next = run.plan.pendingTypeIds(ordering).first { typeId in
-            run.tracked.contains(typeId)
-                && !run.resting.contains(BackfillPlan.rejectionKey(typeId: typeId, lane: .backfill))
+        func nextType() -> String? {
+            run.plan.pendingTypeIds(ordering).first { typeId in
+                run.tracked.contains(typeId)
+                    && !run.resting.contains(BackfillPlan.rejectionKey(typeId: typeId, lane: .backfill))
+            }
         }
-        guard let typeId = next else {
+        // Bevor der Zyklus endet: ein Auftrag, der während des Nachholens kam, läuft noch mit.
+        guard let typeId = nextType() ?? (adoptNewPendingEntries(run) ? nextType() : nil) else {
             finish(run)
             return
         }
@@ -755,8 +772,9 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
                     let fresh = window.items.filter { !boundary.contains(reader.identity(of: $0).id) }
                     guard !fresh.isEmpty else {
                         // Im Fenster liegt nichts Ungeliefertes mehr.
-                        run.plan.markDone(typeId: typeId)
-                        if !savePlan(run) { run.stop = .failed }
+                        if !savePlan(run, { $0.markDone(typeId: typeId) }), run.stop == nil {
+                            run.stop = .failed
+                        }
                         next()
                         return
                     }
@@ -808,8 +826,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         let (state, action) = RejectionPolicy.decide(
             state: run.plan.rejections[key], httpStatus: httpStatus, attemptedLimit: max(fresh.count, 1)
         )
-        run.plan.rejections[key] = state
-        savePlan(run)
+        savePlan(run) { $0.rejections[key] = state }
 
         switch action {
         case .halve(let limit):
@@ -855,24 +872,28 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     /// ist der Typ fertig; sonst bleibt auf dem ältesten Zeitpunkt die Liste seiner gelieferten
     /// Samples als Grenze.
     private func advanceBackfill(_ run: CycleRun, typeId: String, delivered: [Item], hasMore: Bool) {
-        let before = run.plan.entries[typeId]
+        let mutation: (inout BackfillPlan) -> Void
         if !hasMore {
-            run.plan.markDone(typeId: typeId)
+            mutation = { $0.markDone(typeId: typeId) }
         } else {
             let stamped = delivered.map { reader.identity(of: $0) }
             if let oldest = stamped.map({ $0.endDate }).min() {
                 let bucket = LaneTime.ceil(oldest)
                 let ids = stamped.filter { LaneTime.ceil($0.endDate) == bucket }.map { $0.id }
-                run.plan.advance(typeId: typeId, to: oldest, boundaryIds: ids)
+                mutation = { $0.advance(typeId: typeId, to: oldest, boundaryIds: ids) }
+            } else {
+                mutation = { _ in }
             }
         }
-        if run.plan.entries[typeId] == before {
+        var probe = run.plan
+        mutation(&probe)
+        if probe.entries[typeId] == run.plan.entries[typeId] {
             // Der Reader lieferte Samples außerhalb des Fensters. Ohne Fortschritt nicht in einer
             // Schleife enden.
             run.tally.events.append("noProgress:\(typeId)")
             run.resting.insert(BackfillPlan.rejectionKey(typeId: typeId, lane: .backfill))
         }
-        if !savePlan(run) { run.stop = .failed }
+        if !savePlan(run, mutation), run.stop == nil { run.stop = .failed }
         run.context.heartbeat()
     }
 
@@ -902,21 +923,70 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     private func clearRejection(_ run: CycleRun, typeId: String, lane: Lane) {
         let key = BackfillPlan.rejectionKey(typeId: typeId, lane: lane)
         guard run.plan.rejections[key] != nil else { return }
-        run.plan.clearRejection(typeId: typeId, lane: lane)
-        savePlan(run)
+        savePlan(run) { $0.clearRejection(typeId: typeId, lane: lane) }
     }
 
-    /// Speichert den Plan. Scheitert es, steht es im Ergebnis (`failed("plan")`), und der Aufrufer
-    /// entscheidet, ob er weitermacht.
-    @discardableResult
-    private func savePlan(_ run: CycleRun) -> Bool {
+    private enum PlanWrite {
+        case written
+        /// Die Generation ist verloren, nichts geschrieben.
+        case fenced
+        /// Platte oder nicht lesbare Datei.
+        case failed
+    }
+
+    /// Ändert den Plan als ein Schritt auf dem Stand der Datei (`update`) und nur mit gültiger
+    /// Generation (HI-01). Danach ist `run.plan` der geschriebene Stand, mit allem, was andere
+    /// Schreiber inzwischen angelegt haben (ME-04). Ohne Schreiben bleibt `run.plan`, wie er war.
+    private func writePlan(_ run: CycleRun, _ mutate: @escaping (inout BackfillPlan) -> Void) -> PlanWrite {
+        var written: BackfillPlan?
         do {
-            try backfill.save(run.plan)
-            return true
+            let current = try run.context.commitIfCurrent { [backfill] in
+                written = try backfill.update(mutate)
+            }
+            guard current, let plan = written else { return .fenced }
+            run.plan = plan
+            return .written
         } catch {
+            return .failed
+        }
+    }
+
+    /// `writePlan` für die übrigen Stellen: ein Fehlschlag steht im Ergebnis (`failed("plan")`), und
+    /// die Änderung gilt wie bisher im Speicher; der Aufrufer entscheidet, ob er weitermacht. Eine
+    /// verlorene Generation bricht den Zyklus ab. `true` nur, wenn geschrieben wurde.
+    @discardableResult
+    private func savePlan(_ run: CycleRun, _ mutate: @escaping (inout BackfillPlan) -> Void) -> Bool {
+        switch writePlan(run, mutate) {
+        case .written:
+            return true
+        case .fenced:
+            cancel(run)
+            return false
+        case .failed:
+            mutate(&run.plan)
             run.tally.events.append("planSaveFailed")
             run.tally.setFailure("plan")
             return false
         }
+    }
+
+    /// Schreibt einen Anchor nur mit gültiger Generation fest, geprüft und geschrieben in einem
+    /// Schritt (HI-01). `false`: nichts geschrieben.
+    private func commitAnchor(_ run: CycleRun, _ anchor: AnchorToken, for typeId: String) -> Bool {
+        (try? run.context.commitIfCurrent { [cursors] in cursors.commit(anchor, for: typeId) }) ?? false
+    }
+
+    /// Übernimmt offene Einträge, die ein anderer Schreiber seit dem letzten Schreiben dieses
+    /// Zyklus angelegt hat (`requestBackfill` während des Nachholens, ME-04). Nur hinzufügen, nie
+    /// etwas entfernen. `true`, wenn etwas dazukam.
+    private func adoptNewPendingEntries(_ run: CycleRun) -> Bool {
+        let fresh = backfill.load()
+        var added = false
+        for (typeId, entry) in fresh.entries where entry.state == .pending {
+            guard run.plan.entries[typeId]?.state != .pending else { continue }
+            run.plan.entries[typeId] = entry
+            added = true
+        }
+        return added
     }
 }

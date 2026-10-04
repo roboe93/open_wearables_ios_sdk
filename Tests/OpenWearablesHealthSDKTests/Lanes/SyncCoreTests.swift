@@ -786,6 +786,74 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertTrue(h.sink.deliveries.isEmpty)
         XCTAssertFalse(result.backfillPending, "ein nicht mehr verfolgter Typ zählt nicht als offen")
     }
+
+    // MARK: Generation und Nachholplan (Review HI-01, ME-04)
+
+    /// HI-01: Ein Zyklus, der während des Anchor-Durchlaufs seine Generation verliert (Übernahme
+    /// durch einen neueren Zyklus), schreibt danach weder den Nachholplan noch den Anchor. Sonst
+    /// überschriebe er den Plan des neueren Zyklus und hinterließe einen Anchor ohne Nachholeintrag.
+    func testABootstrapThatLosesItsGenerationDuringTheAnchorPassWritesNeitherPlanNorAnchor() {
+        let h = LaneHarness()
+        h.reader.insert(heartRate, id: "hr-1", endDate: ago(h, 600))
+        h.reader.onCurrentAnchor = { [unowned h] _ in h.cancelled = true }
+
+        let result = h.run(h.context([heartRate]))
+
+        XCTAssertNil(h.cursors.anchor(for: heartRate), "ein abgelöster Zyklus schreibt keinen Anchor")
+        XCTAssertNil(h.log.index(ofPrefix: "commit:"))
+        XCTAssertEqual(h.store.saveCount, 0, "ein abgelöster Zyklus schreibt keinen Plan")
+        XCTAssertNil(h.store.plan.entries[heartRate])
+        XCTAssertEqual(result.status, .partial(.cancelled))
+    }
+
+    /// HI-01: Auch das leere Fenster (Typ fertig) schreibt nur mit gültiger Generation.
+    func testAnEmptyWindowOfACycleThatLostItsGenerationDoesNotMarkTheTypeDone() {
+        let h = LaneHarness()
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: heartRate, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+        h.presetAnchors([heartRate])
+        h.reader.onFetchWindow = { [unowned h] _ in h.cancelled = true }
+
+        let result = h.run(h.context([heartRate]))
+
+        XCTAssertEqual(h.store.plan.entries[heartRate]?.state, .pending, "der neuere Zyklus findet den Eintrag offen vor")
+        XCTAssertEqual(h.store.saveCount, 0)
+        XCTAssertEqual(result.status, .partial(.cancelled))
+    }
+
+    /// ME-04: Ein Nachholauftrag, der eintrifft, während der Zyklus nachholt (Diagnose "Typ neu
+    /// laden"), wird vom laufenden Zyklus nicht überschrieben. Er bleibt im Plan und wird noch im
+    /// selben Zyklus abgearbeitet.
+    func testABackfillRequestedWhileTheCycleRunsIsKeptAndCaughtUpInTheSameCycle() {
+        let h = LaneHarness()
+        for i in 1...5 { h.reader.insert(heartRate, id: "hr-\(i)", endDate: ago(h, Double(i) * 600)) }
+        h.reader.insert(weight, id: "w-old", endDate: ago(h, 3_600))
+        h.presetAnchors([heartRate, weight])
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: heartRate, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+
+        var requested = false
+        h.sink.onDeliver = { [unowned h] delivery in
+            guard delivery.lane == .backfill, !requested else { return }
+            requested = true
+            // Ein zweiter Schreiber (requestBackfill) legt einen Eintrag an, am Kern vorbei.
+            var current = h.store.plan
+            current.start(typeId: self.weight, now: h.clock.now(), daysBack: 14, origin: "request")
+            h.store.plan = current
+        }
+
+        let result = h.run(h.context([heartRate, weight], chunkLimit: 2))
+
+        XCTAssertTrue(requested)
+        XCTAssertNotNil(h.store.plan.entries[weight], "der Auftrag ist nicht überschrieben worden")
+        XCTAssertEqual(h.store.plan.entries[weight]?.origin, "request")
+        XCTAssertEqual(h.store.plan.entries[weight]?.state, .done, "und noch im selben Zyklus abgearbeitet")
+        XCTAssertTrue(h.sink.deliveries.flatMap { $0.ids }.contains("w-old"))
+        XCTAssertEqual(h.store.plan.entries[heartRate]?.state, .done)
+        XCTAssertFalse(result.backfillPending)
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.

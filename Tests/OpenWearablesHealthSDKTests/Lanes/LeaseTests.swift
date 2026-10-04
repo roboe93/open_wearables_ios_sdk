@@ -274,4 +274,81 @@ final class LeaseTests: XCTestCase {
             }
         }
     }
+
+    // MARK: Schreiben nur mit gültiger Generation (Review HI-01)
+
+    func testACommitOfARunThatLostItsSlotIsRefusedAndWritesNothing() {
+        withIsolatedSDK { sdk, _ in
+            withClock(sdk) { advance in
+                guard let old = sdk.beginSyncRun() else { return XCTFail("Slot nicht erhalten") }
+                advance(151)
+                guard let new = sdk.beginSyncRun() else {
+                    sdk.finishSync(generation: old)
+                    return XCTFail("Übernahme erwartet")
+                }
+                defer {
+                    sdk.finishSync(generation: old)
+                    sdk.finishSync(generation: new)
+                }
+
+                var writes: [Int] = []
+                XCTAssertFalse(sdk.commitIfCurrent(generation: old) { writes.append(old) })
+                XCTAssertTrue(sdk.commitIfCurrent(generation: new) { writes.append(new) })
+                XCTAssertEqual(writes, [new], "nur der Lauf, dem der Slot gehört, schreibt")
+            }
+        }
+    }
+
+    func testACancelledRunCannotCommit() {
+        withIsolatedSDK { sdk, _ in
+            guard let generation = sdk.beginSyncRun() else { return XCTFail("Slot nicht erhalten") }
+            defer { sdk.finishSync(generation: generation) }
+            sdk.cancelSync()
+
+            var wrote = false
+            XCTAssertFalse(sdk.commitIfCurrent(generation: generation) { wrote = true })
+            XCTAssertFalse(wrote)
+        }
+    }
+
+    /// Prüfen und Schreiben sind ein Schritt: ein Abbruch (und ebenso eine Übernahme) wartet, bis
+    /// ein Schreibschritt, der schon läuft, fertig ist. Danach schreibt der alte Lauf nichts mehr.
+    /// Ohne das läge zwischen Prüfung und Schreiben ein Fenster, in dem ein neuerer Lauf schon
+    /// geladen hat und der alte ihm den Stand überschreibt (TOCTOU).
+    func testACancelWaitsForAWriteThatIsAlreadyRunningAndFencesTheNextOne() {
+        withIsolatedSDK { sdk, _ in
+            guard let generation = sdk.beginSyncRun() else { return XCTFail("Slot nicht erhalten") }
+            defer { sdk.finishSync(generation: generation) }
+
+            let writing = DispatchSemaphore(value: 0)
+            let done = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var writeEnded: Date?
+            DispatchQueue.global().async {
+                _ = sdk.commitIfCurrent(generation: generation) {
+                    writing.signal()
+                    Thread.sleep(forTimeInterval: 0.3)
+                    lock.lock()
+                    writeEnded = Date()
+                    lock.unlock()
+                }
+                done.signal()
+            }
+            XCTAssertEqual(writing.wait(timeout: .now() + 5), .success)
+
+            sdk.cancelSync()
+            let cancelReturned = Date()
+
+            XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+            lock.lock()
+            let ended = writeEnded
+            lock.unlock()
+            XCTAssertNotNil(ended)
+            XCTAssertGreaterThanOrEqual(cancelReturned, ended ?? .distantFuture, "der Abbruch kam erst nach dem Schreiben durch")
+
+            var wroteAgain = false
+            XCTAssertFalse(sdk.commitIfCurrent(generation: generation) { wroteAgain = true })
+            XCTAssertFalse(wroteAgain)
+        }
+    }
 }

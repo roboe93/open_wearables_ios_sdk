@@ -200,6 +200,65 @@ final class LaneStoresTests: XCTestCase {
         }
     }
 
+    // MARK: Mehrere Schreiber (Review HI-01, ME-04, LO-07)
+
+    /// Ein Speicher, der seit seinem `load` einen fremden Stand verpasst hat, darf die Datei nicht
+    /// mit seinem alten Stand ersetzen: der fremde Eintrag ginge still verloren.
+    func testSavingAStalePlanOverAnotherWritersChangeIsRefusedAsAConflict() throws {
+        try withIsolatedSDK { sdk, _ in
+            let first = sdk.makeBackfillStore()
+            var stale = first.load()
+
+            let second = sdk.makeBackfillStore()
+            var other = second.load()
+            other.start(typeId: weight, now: epoch, daysBack: 14, origin: "request")
+            try second.save(other)
+
+            stale.start(typeId: heartRate, now: epoch, daysBack: 14, origin: "bootstrap")
+            XCTAssertThrowsError(try first.save(stale)) { error in
+                XCTAssertEqual(error as? FileBackfillStore.StoreError, .conflict)
+            }
+            XCTAssertNotNil(sdk.makeBackfillStore().load().entries[weight], "der fremde Eintrag bleibt")
+        }
+    }
+
+    /// `update` setzt die eigene Änderung auf den Stand, den ein anderer Schreiber inzwischen
+    /// gespeichert hat, und liefert den geschriebenen Plan.
+    func testUpdateAppliesTheChangeOnTopOfWhatAnotherWriterSaved() throws {
+        try withIsolatedSDK { sdk, _ in
+            let first = sdk.makeBackfillStore()
+            _ = first.load()
+
+            try sdk.makeBackfillStore().update {
+                $0.start(typeId: weight, now: epoch, daysBack: 14, origin: "request")
+            }
+            let written = try first.update {
+                $0.start(typeId: heartRate, now: epoch, daysBack: 14, origin: "bootstrap")
+            }
+
+            XCTAssertEqual(Set(written.entries.keys), [heartRate, weight])
+            XCTAssertEqual(sdk.makeBackfillStore().load(), written)
+            // Nach dem eigenen Schreiben ist der Stand bekannt: ein `save` darauf ist kein Konflikt.
+            var next = written
+            next.markDone(typeId: weight)
+            XCTAssertNoThrow(try first.save(next))
+        }
+    }
+
+    /// Je Datei eine Sperre für den ganzen Prozess, nicht je Instanz: zwei Instanzen, die
+    /// gleichzeitig schreiben, verlieren keinen Eintrag.
+    func testConcurrentUpdatesFromSeparateInstancesLoseNothing() throws {
+        try withIsolatedSDK { sdk, _ in
+            let stores = [sdk.makeBackfillStore(), sdk.makeBackfillStore()]
+            DispatchQueue.concurrentPerform(iterations: 40) { index in
+                _ = try? stores[index % 2].update {
+                    $0.start(typeId: "Type\(index)", now: self.epoch, daysBack: 14, origin: "request")
+                }
+            }
+            XCTAssertEqual(sdk.makeBackfillStore().load().entries.count, 40)
+        }
+    }
+
     // MARK: Geparkte Datensätze
 
     func testParkingWritesOneFileWithTheFieldsAndTheRecord() throws {

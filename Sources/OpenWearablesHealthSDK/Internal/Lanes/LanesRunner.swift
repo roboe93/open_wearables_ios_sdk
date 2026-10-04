@@ -270,7 +270,11 @@ extension OpenWearablesHealthSDK {
             isCancelled: { [weak self] in self?.isSyncCancelled(generation: generation) ?? true },
             heartbeat: { [weak self] in self?.heartbeat(generation: generation) },
             // Unbekannt gilt als lesbar: dann entscheidet der Abfragefehler (Pattern 7).
-            isProtectedDataAvailable: { [weak self] in self?.protectedDataAvailableCache ?? true }
+            isProtectedDataAvailable: { [weak self] in self?.protectedDataAvailableCache ?? true },
+            commitIfCurrent: { [weak self] write in
+                guard let self = self else { return false }
+                return try self.commitIfCurrent(generation: generation, write)
+            }
         )
 
         let runCore = { [self] in
@@ -536,34 +540,36 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        // Offener Export: Nachholplan zuerst.
-        var plan = backfill.load()
-        let original = plan
+        // Offener Export: Nachholplan zuerst, als ein Schritt auf dem Stand der Datei (HI-01): ein
+        // Eintrag, den ein anderer Schreiber angelegt hat, bleibt erhalten.
         let completed = state.completedTypes.union(state.typeProgress.values.filter { $0.isComplete }.map { $0.typeIdentifier })
         var olderThan: [String: Date] = [:]
         for (typeId, progress) in state.typeProgress where !progress.isComplete {
             if let cursor = progress.pendingOlderThan { olderThan[typeId] = cursor }
         }
-        plan.adoptOpenExport(
-            completedTypes: completed,
-            olderThanCursors: olderThan,
-            floor: syncStartDate() ?? now.addingTimeInterval(-Double(lanesDaysBack()) * 86_400),
-            now: now,
-            typeIds: typeIds
-        )
-        result.plannedTypes = Set(plan.entries.keys).subtracting(original.entries.keys).sorted()
-        if plan != original {
-            do {
-                try backfill.save(plan)
-            } catch {
-                // Ohne Plan kein Anchor: ein Anchor ohne Plan ließe die Historie des Typs ungeholt.
-                logMessage("Adoption: backfill plan could not be saved - session stays, nothing taken over")
-                result.plannedTypes = []
-                journalAdoption(result)
-                completion(result)
-                return
+        let floor = syncStartDate() ?? now.addingTimeInterval(-Double(lanesDaysBack()) * 86_400)
+        var existingTypes: Set<String> = []
+        let plan: BackfillPlan
+        do {
+            plan = try backfill.update { plan in
+                existingTypes = Set(plan.entries.keys)
+                plan.adoptOpenExport(
+                    completedTypes: completed,
+                    olderThanCursors: olderThan,
+                    floor: floor,
+                    now: now,
+                    typeIds: typeIds
+                )
             }
+        } catch {
+            // Ohne Plan kein Anchor: ein Anchor ohne Plan ließe die Historie des Typs ungeholt.
+            logMessage("Adoption: backfill plan could not be saved - session stays, nothing taken over")
+            result.plannedTypes = []
+            journalAdoption(result)
+            completion(result)
+            return
         }
+        result.plannedTypes = Set(plan.entries.keys).subtracting(existingTypes).sorted()
 
         let needAnchor = typeIds.filter { typeId in
             guard let entry = plan.entries[typeId], entry.state == .pending, entry.origin == "adoptedExport" else { return false }

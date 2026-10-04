@@ -335,6 +335,26 @@ final class InMemoryBackfillStore: BackfillStoring {
         lock.unlock()
         log?.add("plan.save")
     }
+
+    /// Wie `FileBackfillStore.update`: Lesen, Ändern und Schreiben in einem Schritt. Zählt wie
+    /// `save` als Speichern.
+    @discardableResult
+    func update(_ mutate: (inout BackfillPlan) throws -> Void) throws -> BackfillPlan {
+        if failSaves { throw FakeStoreError.disk }
+        lock.lock()
+        var plan = current
+        do {
+            try mutate(&plan)
+        } catch {
+            lock.unlock()
+            throw error
+        }
+        current = plan
+        saves += 1
+        lock.unlock()
+        log?.add("plan.save")
+        return plan
+    }
 }
 
 final class InMemoryDeletionQueue: DeletionQueueing {
@@ -430,6 +450,8 @@ final class LaneHarness {
     let core: SyncCore<FakeReader, FakeSink>
 
     private let flagLock = NSLock()
+    /// Wie die Generationssperre im SDK: ein Abbruch wartet, bis ein laufender Schreibschritt fertig ist.
+    private let commitLock = NSRecursiveLock()
     private var protectedAvailable = true
     private var cancelledFlag = false
     private var beats = 0
@@ -453,7 +475,13 @@ final class LaneHarness {
 
     var cancelled: Bool {
         get { flagLock.lock(); defer { flagLock.unlock() }; return cancelledFlag }
-        set { flagLock.lock(); cancelledFlag = newValue; flagLock.unlock() }
+        set {
+            commitLock.lock()
+            flagLock.lock()
+            cancelledFlag = newValue
+            flagLock.unlock()
+            commitLock.unlock()
+        }
     }
 
     var heartbeatCount: Int {
@@ -473,7 +501,16 @@ final class LaneHarness {
                 self.beats += 1
                 self.flagLock.unlock()
             },
-            isProtectedDataAvailable: { [unowned self] in self.protectedDataAvailable }
+            isProtectedDataAvailable: { [unowned self] in self.protectedDataAvailable },
+            // Wie im SDK: geschrieben wird nur mit gültiger Generation, Prüfung und Schreiben in
+            // einem Schritt unter der Sperre des Harness.
+            commitIfCurrent: { [unowned self] write in
+                self.commitLock.lock()
+                defer { self.commitLock.unlock() }
+                guard !self.cancelled else { return false }
+                try write()
+                return true
+            }
         )
     }
 
