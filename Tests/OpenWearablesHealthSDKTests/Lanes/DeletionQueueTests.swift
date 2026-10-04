@@ -344,4 +344,16 @@ final class DeletionQueueTests: XCTestCase {
         let queue = makeQueue()
         XCTAssertEqual(queue.unsent(limit: 5).map(\.id), ["x1"])
     }
+
+    /// Review LO-07: Zyklus, abgelöster Zyklus und `getSyncStatus` haben je eine eigene Instanz.
+    /// Die Sperre gilt für die Datei im ganzen Prozess, nicht je Instanz: nichts geht verloren.
+    func testTwoQueueInstancesWritingAtOnceLoseNothing() {
+        withIsolatedSDK { sdk, _ in
+            let queues = [sdk.makeDeletionQueue(), sdk.makeDeletionQueue()]
+            DispatchQueue.concurrentPerform(iterations: 40) { index in
+                try? queues[index % 2].enqueue([DeletedRef(id: "d-\(index)", type: self.weight)], sentAt: nil)
+            }
+            XCTAssertEqual(sdk.makeDeletionQueue().stats().total, 40)
+        }
+    }
 }

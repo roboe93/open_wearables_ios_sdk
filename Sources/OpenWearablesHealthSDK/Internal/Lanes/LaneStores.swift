@@ -124,6 +124,19 @@ final class DefaultsCursorStore: CursorStore {
 enum LaneFileLocks {
     private static let guardLock = NSLock()
     private static var locks: [String: NSRecursiveLock] = [:]
+    private static var queues: [String: DispatchQueue] = [:]
+
+    /// Eine serielle Queue je Datei, für Speicher, die ihre Schritte als `queue.sync` ausführen
+    /// (`DeletionQueue`).
+    static func queue(for url: URL) -> DispatchQueue {
+        let key = url.standardizedFileURL.path
+        guardLock.lock()
+        defer { guardLock.unlock() }
+        if let existing = queues[key] { return existing }
+        let created = DispatchQueue(label: "health_lanes_file.\(url.lastPathComponent)")
+        queues[key] = created
+        return created
+    }
 
     static func lock(for url: URL) -> NSRecursiveLock {
         let key = url.standardizedFileURL.path

@@ -55,8 +55,10 @@ final class DeletionQueue: DeletionQueueing {
     private let journal: RunJournal?
     private let log: (String) -> Void
 
-    /// Serielle Queue: Lesen, Ändern und Schreiben sind ein Schritt.
-    private let queue = DispatchQueue(label: "health_deletions")
+    /// Serielle Queue je Datei, für den ganzen Prozess: Lesen, Ändern und Schreiben sind ein
+    /// Schritt, auch über Instanzen hinweg (Review LO-07). Zyklus, abgelöster Zyklus und
+    /// `getSyncStatus` bauen je eine eigene Instanz.
+    private let queue: DispatchQueue
 
     init(
         directory: URL,
@@ -67,6 +69,7 @@ final class DeletionQueue: DeletionQueueing {
         maxAge: TimeInterval = 90 * 24 * 3600
     ) {
         self.directory = directory
+        self.queue = LaneFileLocks.queue(for: directory.appendingPathComponent("queue.json"))
         self.clock = clock
         self.journal = journal
         self.log = log
