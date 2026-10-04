@@ -211,7 +211,7 @@ extension OpenWearablesHealthSDK {
         // Whether the initial full export (newest-first crawl of the whole history)
         // has ever completed for this user. False = historical sync still pending
         // or in progress; apps can use this to show a "keep the app open" hint.
-        let initialExportDone = defaults.bool(forKey: fullDoneKey())
+        let initialExportDone = isInitialExportDone()
         
         if let state = loadSyncState() {
             return [

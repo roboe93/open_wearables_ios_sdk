@@ -399,13 +399,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.trackedTypes = mapTypesFromStrings(storedTypes)
             logMessage("Restored \(trackedTypes.count) tracked types")
         }
-        
+
         if let tokenRefreshURL = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl() {
             logMessage("Configured: host=\(host), tokenRefreshURL=\(tokenRefreshURL)")
         } else {
             logMessage("Configured: host=\(host)")
         }
-        
+
+        // Fork: Altzustand übernehmen, bevor `autoRestoreSync` und die ersten Auslöser
+        // `fullDone` lesen. Sonst eskaliert der erste Lauf nach dem Update zum Neu-Export.
+        adoptLegacyStateIfNeeded()
+
         if OpenWearablesHealthSdkKeychain.isSyncActive() && OpenWearablesHealthSdkKeychain.hasSession() && !trackedTypes.isEmpty {
             logMessage("Auto-restoring background sync...")
             DispatchQueue.main.async { [weak self] in
@@ -716,7 +720,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         // Resume when there is a session with progress, but also when the initial
         // full export never completed (e.g. it was interrupted before its first
         // successful upload - such a session has no progress to detect).
-        let fullDone = defaults.bool(forKey: fullDoneKey())
+        let fullDone = isInitialExportDone()
         if hasResumableSyncSession() || !fullDone {
             logMessage("Found interrupted sync, will resume...")
             syncAll(fullExport: false) {
@@ -853,16 +857,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         logMessage("Types to sync (\(queryableTypes.count)): \(typeNames)")
         
         let existingState = loadSyncState()
-        let fullDone = defaults.bool(forKey: fullDoneKey())
 
-        let effectiveFullExport: Bool
-        if let state = existingState, state.fullExport {
-            effectiveFullExport = true
-        } else if !fullDone {
-            effectiveFullExport = true
-        } else {
-            effectiveFullExport = fullExport
-        }
+        // Entscheidung als reine Funktion (Fork): `LegacyAdoption.swift`, dort auch begründet.
+        let effectiveFullExport = Self.effectiveFullExport(
+            existingFullExport: existingState?.fullExport,
+            fullDone: isInitialExportDone(),
+            requested: fullExport
+        )
         if effectiveFullExport && !fullExport {
             logMessage("Escalating to full export (initial export not completed yet)")
         }
@@ -990,7 +991,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         if !fullExport {
-            let fullDone = defaults.bool(forKey: fullDoneKey())
+            let fullDone = isInitialExportDone()
             for type in types where !rrState.completedTypes.contains(type.identifier) && rrState.anchorCursors[type.identifier] == nil {
                 if let anchor = loadAnchor(for: type) {
                     rrState.anchorCursors[type.identifier] = anchor
@@ -1906,7 +1907,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             guard OpenWearablesHealthSdkKeychain.isSyncActive(), self.hasAuth else { return }
             
-            let fullDone = self.defaults.bool(forKey: self.fullDoneKey())
+            let fullDone = self.isInitialExportDone()
             guard self.hasResumableSyncSession() || !fullDone else { return }
             
             guard !self.isSyncInProgress else {
@@ -1929,7 +1930,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self = self else { return }
             
-            let fullDone = self.defaults.bool(forKey: self.fullDoneKey())
+            let fullDone = self.isInitialExportDone()
             guard self.hasResumableSyncSession() || !fullDone else {
                 self.logMessage("No sync to resume")
                 return

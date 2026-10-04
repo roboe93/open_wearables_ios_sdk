@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.15.0-ow.1 (Fork roboe93)
+
+* **Upstream 0.15.0 übernommen, eigene Funktionen erhalten.** Der Fork-Stand 0.13.2 (Mirror-Dedupe und GPS-Strecken von Workouts) ist mit Upstream 0.15.0 zusammengeführt. Mirror-Dedupe läuft im Upload-Block über die 0.15-API `uploadCombinedPayload(generation:)`, die Strecke (`route`) steht im Workout neben den Upstream-Runden (`laps`). Die Versionskennung ist `0.15.0-ow.1`, damit Backend und Logs den Fork-Stand sehen und keinen reinen Upstream-Stand vorgetäuscht bekommen. `defaults` ist jetzt `var` (Testnaht wie `stateDirectoryOverride`); Produktion ändert den Wert nie.
+* **Altzustand wird übernommen statt neu exportiert** (Messung am iPhone 18 Pro, 04.10.2026): 0.14 und 0.15 werten `fullDone.<userKey>` aus, 0.13.2 las es nie. Am Gerät fehlte `fullDone` unter dem Nutzerschlüssel, es stand nur `fullDone.user.none = false` (`signIn()` setzt die Anchors zurück, bevor die Zugangsdaten gespeichert sind). Ohne Gegenmaßnahme hätte der erste Lauf nach dem Update einen Export über das ganze Fenster und alle Typen begonnen. `adoptLegacyStateIfNeeded()` markiert den Erst-Export als erledigt, wenn `fullDone` für den angemeldeten Nutzer nicht gesetzt ist, Anchors für ihn vorhanden sind und keine offene Export-Sitzung besteht. Es schreibt genau einen Boolean. Ein ausdrückliches `false` (nach `signOut`) und ein offener Export bleiben unangetastet. Alle Lesestellen von `fullDone` laufen über `isInitialExportDone()`, `configure(host:tokenRefreshURL:)` adoptiert vor dem automatischen Wiederaufnehmen. Die Entscheidung "Export oder inkrementell" ist als reine Funktion `effectiveFullExport(existingFullExport:fullDone:requested:)` herausgezogen und ohne HealthKit testbar.
+
 ## 0.15.0
 
 * **Cycling power and cadence** (#44): authorize and sync `cyclingPower`, `cyclingCadence`, `cyclingSpeed`, and `cyclingFunctionalThresholdPower` (iOS 17+) as quantity samples — the same path as `heartRate` / `runningPower` — so Bluetooth power-meter timeseries and Apple Watch cycling workouts actually reach the backend. Workout-level averages for power, cadence and speed are populated from `HKWorkout` statistics.
