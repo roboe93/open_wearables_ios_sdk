@@ -601,6 +601,29 @@ final class OrchestrationSwitchTests: XCTestCase {
         XCTAssertEqual(outcome.scope, .run)
     }
 
+    // MARK: - Vorgemerkte Auslöser laufen über die Weiche (Review LO-01)
+
+    /// Wird auf "Original 0.15" umgestellt, während ein Zyklus mit Vormerkungen endet, läuft danach
+    /// kein Zwei-Spuren-Zyklus mehr: der vorgemerkte Auslöser fragt die Weiche wie jeder andere.
+    func testADeferredTriggerRunsThroughTheSwitch() throws {
+        try XCTSkipUnless(HKHealthStore.isHealthDataAvailable(), "HealthKit nicht verfügbar")
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .upstream) { sdk, _ in
+                withTrackedTypes([HKCorrelationType(.bloodPressure)], on: sdk) {
+                    var outcome: SyncOutcome?
+                    sdk.runDeferredLanesTriggers([DeferredLanesTrigger(
+                        trigger: .network, isBackground: false, deadline: nil, completion: { outcome = $0 }
+                    )])
+
+                    XCTAssertTrue(waitUntil { outcome != nil })
+                    XCTAssertEqual(outcome?.orchestration, .upstream, "der Rückweg gilt auch für Vorgemerktes")
+                    XCTAssertEqual(outcome?.trigger, .network)
+                    XCTAssertFalse(sdk.isSyncInProgress)
+                }
+            }
+        }
+    }
+
     // MARK: - Ereignisse fürs Journal
 
     func testCoreEventsAreGroupedIntoOneEntryPerKindAndNeverFloodTheRing() {

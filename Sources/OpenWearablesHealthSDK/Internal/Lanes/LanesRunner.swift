@@ -134,11 +134,16 @@ extension OpenWearablesHealthSDK {
 
     /// Startet vorgemerkte Auslöser neu, hinter dem Ende des Zyklus auf der Hauptschlange. Der
     /// erste beginnt einen Zyklus, die weiteren fordern eine Live-Runde an.
+    ///
+    /// Über die Weiche (`collectAllData`), nicht direkt in den Zwei-Spuren-Zyklus (Review LO-01):
+    /// wurde inzwischen auf upstream gestellt, liefe sonst noch ein lanes-Zyklus mit neuer,
+    /// nicht abgebrochener Generation, übernähme etwa eine gerade entstandene `state.json` und
+    /// schriebe Anchors, obwohl der Rückweg gewählt ist.
     internal func runDeferredLanesTriggers(_ deferred: [DeferredLanesTrigger]) {
         for item in deferred {
             DispatchQueue.main.async { [self] in
-                runLanesCycle(
-                    trigger: item.trigger, isBackground: item.isBackground,
+                collectAllData(
+                    fullExport: false, isBackground: item.isBackground, trigger: item.trigger,
                     deadline: item.deadline, completion: item.completion
                 )
             }
