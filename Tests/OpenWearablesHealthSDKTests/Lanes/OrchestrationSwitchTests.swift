@@ -391,6 +391,61 @@ final class OrchestrationSwitchTests: XCTestCase {
         }
     }
 
+    // MARK: - Frist an den laufenden Zyklus (Review ME-01)
+
+    /// Ein Auslöser mit Frist (BGTask der App oder des SDK) wartet auf die Live-Runde eines Zyklus,
+    /// der vielleicht keine Frist hat. Seine Frist gilt dann für den Zyklus: gibt der Auslöser seinen
+    /// Task zurück, läuft der fremde Zyklus sonst ohne Frist weiter und wird suspendiert.
+    func testATriggerWithADeadlineHandsItsDeadlineToTheRunningCycle() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
+                var tightened: [Date] = []
+                sdk.registerActiveLanesCycle(ActiveLanesCycle(
+                    generation: generation, requestLiveRound: { _ in true }, tighten: { tightened.append($0) }
+                ))
+                defer {
+                    _ = sdk.releaseActiveLanesCycle(generation: generation)
+                    sdk.finishSync(generation: generation)
+                }
+
+                withTrackedTypes([HKQuantityType(.stepCount)], on: sdk) {
+                    let deadline = Date().addingTimeInterval(25)
+                    sdk.sync(trigger: .sdkRefresh, deadline: deadline) { _ in }
+                    XCTAssertEqual(tightened, [deadline])
+
+                    sdk.sync(trigger: .foreground) { _ in }
+                    XCTAssertEqual(tightened, [deadline], "ohne eigene Frist bleibt die des Zyklus")
+                }
+            }
+        }
+    }
+
+    /// Der Ablauf-Handler eines BGTasks der App erreicht den Zyklus des SDK über dieselbe Funktion
+    /// wie die Ablauf-Handler des SDK: die Frist wird "jetzt".
+    func testExpireRunningSyncSetsTheDeadlineOfTheRunningCycleToNow() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
+                var tightened: [Date] = []
+                sdk.registerActiveLanesCycle(ActiveLanesCycle(
+                    generation: generation, requestLiveRound: { _ in true }, tighten: { tightened.append($0) }
+                ))
+                defer {
+                    _ = sdk.releaseActiveLanesCycle(generation: generation)
+                    sdk.finishSync(generation: generation)
+                }
+
+                let before = Date()
+                sdk.expireRunningSync()
+
+                XCTAssertEqual(tightened.count, 1)
+                XCTAssertGreaterThanOrEqual(tightened.first ?? .distantPast, before)
+                XCTAssertLessThanOrEqual(tightened.first ?? .distantFuture, Date())
+            }
+        }
+    }
+
     // MARK: - Ereignisse fürs Journal
 
     func testCoreEventsAreGroupedIntoOneEntryPerKindAndNeverFloodTheRing() {

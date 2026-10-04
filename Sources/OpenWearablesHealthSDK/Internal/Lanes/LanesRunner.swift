@@ -79,16 +79,22 @@ extension OpenWearablesHealthSDK {
 
 // MARK: - Register des laufenden Zyklus
 
-/// Der laufende Zyklus, soweit andere Auslöser ihn brauchen: seine Generation und die Möglichkeit,
-/// eine Live-Runde anzufordern. `requestLiveRound` liefert `false`, wenn der Kern nicht mehr läuft
-/// (der Zyklus endet gerade).
+/// Der laufende Zyklus, soweit andere Auslöser ihn brauchen: seine Generation, die Möglichkeit,
+/// eine Live-Runde anzufordern, und seine Frist vorzuziehen (`tighten`, Review ME-01).
+/// `requestLiveRound` liefert `false`, wenn der Kern nicht mehr läuft (der Zyklus endet gerade).
 internal final class ActiveLanesCycle {
     let generation: Int
     let requestLiveRound: (@escaping (CycleResult) -> Void) -> Bool
+    let tighten: (Date) -> Void
 
-    init(generation: Int, requestLiveRound: @escaping (@escaping (CycleResult) -> Void) -> Bool) {
+    init(
+        generation: Int,
+        requestLiveRound: @escaping (@escaping (CycleResult) -> Void) -> Bool,
+        tighten: @escaping (Date) -> Void = { _ in }
+    ) {
         self.generation = generation
         self.requestLiveRound = requestLiveRound
+        self.tighten = tighten
     }
 }
 
@@ -155,6 +161,12 @@ extension OpenWearablesHealthSDK {
             fireObserverCompletions()
             let outcome = lanesOutcome(from: result, trigger: trigger, started: started, leaseTakenOver: false)
             deliverRun(outcome, protectedStart: protectedStart, completion: completion)
+        }
+        if accepted, let deadline = deadline {
+            // Review ME-01: die Frist des Auslösers (BGTask, Observer im Hintergrund) gilt für den
+            // laufenden Zyklus. Gibt der Auslöser seinen Task zurück, liefe der Zyklus sonst ohne
+            // Frist weiter und würde mittendrin suspendiert.
+            active.tighten(deadline)
         }
         if !accepted {
             // Der Kern läuft nicht mehr, der Slot ist aber noch nicht frei: nach dem Ende neu starten.
@@ -255,9 +267,11 @@ extension OpenWearablesHealthSDK {
             deletions: deletions, parking: makeRejectionParking(),
             clock: SystemLaneClock(), ordering: LaneOrdering()
         )
-        registerActiveLanesCycle(ActiveLanesCycle(generation: generation) { waiter in
-            core.requestLiveRound(waiter)
-        })
+        registerActiveLanesCycle(ActiveLanesCycle(
+            generation: generation,
+            requestLiveRound: { waiter in core.requestLiveRound(waiter) },
+            tighten: { deadline in core.tighten(deadline: deadline) }
+        ))
 
         // Ein gesperrtes iPhone ist nie im Vordergrund: dann gilt das kleine Hintergrund-Chunk,
         // ohne `UIApplication` zu fragen. Bei unbekanntem Zustand entscheidet `currentChunkLimit`.
@@ -372,6 +386,34 @@ extension OpenWearablesHealthSDK {
 
     /// Das gespeicherte Sync-Fenster in Tagen. Nicht gesetzt (0 heißt im Original: ohne Grenze)
     /// gilt 14, wie in `prepareSyncWindow` der App: ein Nachholen ohne Grenze wäre ein Neu-Export.
+    /// Für den Ablauf-Handler eines BGTasks der App (Review ME-01). iOS entzieht die Zeit: die Frist
+    /// des laufenden Zyklus wird "jetzt", er endet an der nächsten Prüfstelle und schreibt sein
+    /// Ergebnis, und laufende Uploads werden abgebrochen, wie es die Ablauf-Handler des SDK tun.
+    /// Ohne laufenden Zyklus bricht der Aufruf nur Uploads ab.
+    public func expireRunningSync() {
+        expireActiveLanesCycle()
+        cancelInFlightSyncUploads(reason: "backgroundExpiration")
+    }
+
+    /// Zieht die Frist des laufenden lanes-Zyklus auf `now` vor. Gemeinsamer Weg aller Ablauf-Handler
+    /// (SDK-BGTasks, Observer-Hintergrundtask, `expireRunningSync`). Im Modus upstream steht kein
+    /// Zyklus im Register, dann geschieht nichts.
+    internal func expireActiveLanesCycle(now: Date = Date()) {
+        lanesCycleLock.lock()
+        let active = activeLanesCycle
+        lanesCycleLock.unlock()
+        active?.tighten(now)
+    }
+
+    /// Obergrenze der Frist eines Observer-Laufs im Hintergrund, falls iOS unbegrenzte Zeit meldet.
+    internal static let observerDeadlineCap: TimeInterval = 300
+
+    /// Frist eines Observer-Laufs im Hintergrund (Review ME-01): fünf Sekunden vor dem Ende der
+    /// Hintergrundzeit, nie in der Vergangenheit, höchstens `observerDeadlineCap`.
+    internal static func observerDeadline(now: Date, backgroundTimeRemaining: TimeInterval) -> Date {
+        now.addingTimeInterval(max(0, min(backgroundTimeRemaining, observerDeadlineCap) - 5))
+    }
+
     internal func lanesDaysBack() -> Int {
         let stored = OpenWearablesHealthSdkKeychain.getSyncDaysBack()
         return stored > 0 ? stored : 14

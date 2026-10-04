@@ -925,6 +925,79 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(h.cursors.anchor(for: weight), FakeReader.token(0))
         XCTAssertEqual(h.store.plan.rejections[weight]?.consecutive, 1)
     }
+
+    // MARK: Frist von außen vorziehen (Review ME-01)
+
+    /// Ein Auslöser mit Frist (BGTask), der an einen laufenden Zyklus ohne Frist übergeben wird, und
+    /// der Ablauf-Handler ziehen die Frist vor. Im Nachholen endet der Zyklus am nächsten Chunk, ohne
+    /// `partial`: neue Daten sind sauber raus.
+    func testTighteningTheDeadlineStopsARunningBackfillAtTheNextChunk() {
+        let h = LaneHarness()
+        for i in 1...10 { h.reader.insert(heartRate, id: "hr-\(i)", endDate: ago(h, Double(i) * 600)) }
+        h.presetAnchors([heartRate])
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: heartRate, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+        var tightened = false
+        h.sink.onDeliver = { [unowned h] delivery in
+            guard delivery.lane == .backfill, !tightened else { return }
+            tightened = true
+            h.core.tighten(deadline: h.clock.now())
+        }
+
+        let result = h.run(h.context([heartRate], chunkLimit: 2))
+
+        XCTAssertEqual(h.sink.deliveries.filter { $0.lane == .backfill }.count, 1, "danach kein weiterer Chunk")
+        XCTAssertEqual(result.status, .transferred)
+        XCTAssertTrue(result.backfillPending)
+    }
+
+    func testTighteningTheDeadlineDuringTheLiveLaneEndsItAsPartialBudget() {
+        let h = LaneHarness()
+        h.presetAnchors([weight, heartRate])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        h.reader.insert(heartRate, id: "hr-1", endDate: ago(h, 20))
+        h.sink.onDeliver = { [unowned h] _ in h.core.tighten(deadline: h.clock.now()) }
+
+        let result = h.run(h.context([heartRate, weight]))
+
+        XCTAssertEqual(result.status, .partial(.budget))
+        XCTAssertEqual(h.sink.deliveries.map { $0.typeIds }, [[weight]])
+    }
+
+    /// Vorziehen heißt nie verlängern: eine spätere Frist ändert die des Zyklus nicht.
+    func testATighterContextDeadlineIsNeverLoosened() {
+        let h = LaneHarness()
+        h.presetAnchors([weight, heartRate])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        h.reader.insert(heartRate, id: "hr-1", endDate: ago(h, 20))
+        h.sink.onDeliver = { [unowned h] _ in
+            h.core.tighten(deadline: h.clock.now().addingTimeInterval(1_000))
+            h.clock.advance(20)
+        }
+
+        let result = h.run(h.context([heartRate, weight], deadline: h.clock.now().addingTimeInterval(10)))
+
+        XCTAssertEqual(result.status, .partial(.budget))
+        XCTAssertEqual(h.sink.deliveries.count, 1)
+    }
+
+    /// Die vorgezogene Frist gilt nur für den Zyklus, in dem sie kam.
+    func testATightenedDeadlineEndsWithItsCycle() {
+        let h = LaneHarness()
+        h.presetAnchors([weight, heartRate])
+        h.reader.insert(weight, id: "w1", endDate: ago(h, 10))
+        h.reader.insert(heartRate, id: "hr-1", endDate: ago(h, 20))
+        h.sink.onDeliver = { [unowned h] _ in h.core.tighten(deadline: h.clock.now()) }
+        _ = h.run(h.context([heartRate, weight]))
+
+        h.sink.onDeliver = nil
+        h.reader.insert(heartRate, id: "hr-2", endDate: ago(h, 5))
+        let second = h.run(h.context([heartRate, weight]))
+
+        XCTAssertEqual(second.status, .transferred, "der zweite Zyklus läuft ohne die alte Frist durch")
+        XCTAssertTrue(h.sink.deliveries.last?.ids.contains("hr-2") ?? false)
+    }
 }
 
 /// Plan-Speicher, der jeden Stand durch die Dateikodierung schickt, wie ein echter es täte.

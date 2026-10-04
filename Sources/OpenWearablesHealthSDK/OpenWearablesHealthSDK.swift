@@ -917,6 +917,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             observerBgTask = UIApplication.shared.beginBackgroundTask(withName: "health_combined_sync") {
                 self.logMessage("Background task expired - cancelling in-flight uploads")
                 self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
+                // Fork (review ME-01): the lanes cycle stops at its next checkpoint as well.
+                self.expireActiveLanesCycle()
                 UIApplication.shared.endBackgroundTask(self.observerBgTask)
                 self.observerBgTask = .invalid
             }
@@ -926,7 +928,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            self.syncAll(fullExport: false, trigger: .observer(typeIdentifier)) { _ in
+            // Fork (review ME-01): in lanes mode an observer run in the background gets a deadline
+            // just before its background time ends, instead of running without one and being
+            // suspended mid-upload. Foreground and upstream mode: no deadline, as before.
+            let deadline = self.orchestration == .lanes ? self.observerRunDeadline() : nil
+            self.syncAll(fullExport: false, trigger: .observer(typeIdentifier), deadline: deadline) { _ in
                 if self.observerBgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(self.observerBgTask)
                     self.observerBgTask = .invalid
@@ -936,6 +942,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         pendingSyncWorkItem = workItem
         syncDebounceQueue.asyncAfter(deadline: .now() + 2.0, execute: workItem)
+    }
+    
+    /// Fork (review ME-01): the deadline of an observer run, `nil` in the foreground.
+    private func observerRunDeadline() -> Date? {
+        backgroundTimeRemainingIfInBackground().map {
+            Self.observerDeadline(now: Date(), backgroundTimeRemaining: $0)
+        }
     }
     
     internal func collectAllData(fullExport: Bool, completion: @escaping () -> Void) {

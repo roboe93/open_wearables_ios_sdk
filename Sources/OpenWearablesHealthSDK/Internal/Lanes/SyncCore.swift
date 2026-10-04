@@ -130,12 +130,14 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
 
     private let queue = DispatchQueue(label: "health_sync_core")
 
-    /// Schützt `running`, `livePending` und `waiters`. Wird nie gehalten, während fremder Code
+    /// Schützt `running`, `livePending`, `waiters` und `tightenedDeadline`. Wird nie gehalten, während fremder Code
     /// (Rückrufe, Waiter) läuft.
     private let stateLock = NSLock()
     private var running = false
     private var livePending = false
     private var waiters: [Waiter] = []
+    /// Von außen vorgezogene Frist des laufenden Zyklus (`tighten`). Gilt nur bis zu dessen Ende.
+    private var tightenedDeadline: Date?
 
     init(
         reader: Reader, sink: Sink, cursors: CursorStore, backfill: BackfillStoring,
@@ -170,6 +172,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             return
         }
         running = true
+        tightenedDeadline = nil
         stateLock.unlock()
 
         queue.async { [self] in
@@ -192,6 +195,28 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         waiters.append(waiter)
         livePending = true
         return true
+    }
+
+    /// Zieht die Frist des laufenden Zyklus vor (Review ME-01): ein Auslöser mit Frist, der an diesen
+    /// Zyklus übergeben wird, oder der Ablauf-Handler eines Tasks ("jetzt"). Nie später als die
+    /// Frist, die schon gilt. Wirkt an der nächsten Prüfstelle; ohne laufenden Zyklus geschieht nichts.
+    func tighten(deadline: Date) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard running else { return }
+        tightenedDeadline = min(tightenedDeadline ?? deadline, deadline)
+    }
+
+    private func currentDeadline(_ run: CycleRun) -> Date? {
+        stateLock.lock()
+        let tightened = tightenedDeadline
+        stateLock.unlock()
+        switch (run.context.deadline, tightened) {
+        case let (own?, other?): return min(own, other)
+        case let (own?, nil): return own
+        case let (nil, other?): return other
+        case (nil, nil): return nil
+        }
     }
 
     // MARK: Start und Ende
@@ -249,6 +274,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
         defer { stateLock.unlock() }
         if livePending && !stopped { return (true, []) }
         running = false
+        tightenedDeadline = nil
         let leftover = waiters
         waiters = []
         livePending = false
@@ -301,7 +327,7 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     private func gate(_ run: CycleRun) -> StopReason? {
         run.context.heartbeat()
         if run.context.isCancelled() { return .cancelled }
-        if let deadline = run.context.deadline, clock.now() >= deadline { return .deadline }
+        if let deadline = currentDeadline(run), clock.now() >= deadline { return .deadline }
         return nil
     }
 

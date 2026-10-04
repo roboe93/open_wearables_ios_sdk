@@ -164,6 +164,9 @@ extension OpenWearablesHealthSDK {
         task.expirationHandler = { [self] in
             logMessage("\(kind.label) task expired - cancelling in-flight uploads")
             cancelInFlightSyncUploads(reason: "backgroundExpiration")
+            // Review ME-01: auch der Zyklus endet an seiner nächsten Prüfstelle, statt nach einer
+            // HealthKit-Abfrage den nächsten Upload zu beginnen. Im Modus upstream ohne Wirkung.
+            expireActiveLanesCycle()
             op.cancel()
             if let grace = budget.expirationGrace {
                 finished.fireAfter(grace)

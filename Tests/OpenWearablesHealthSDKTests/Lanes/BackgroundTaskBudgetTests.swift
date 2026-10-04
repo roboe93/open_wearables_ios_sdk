@@ -243,6 +243,35 @@ final class BackgroundTaskBudgetTests: XCTestCase {
         }
     }
 
+    /// Review ME-01: der Ablauf-Handler bricht nicht nur Uploads ab, er zieht auch die Frist des
+    /// laufenden Zyklus auf "jetzt". Sonst startete ein Zyklus, der gerade in HealthKit liest, danach
+    /// den nächsten Upload und würde mittendrin suspendiert.
+    func testLanesExpirationAlsoEndsTheRunningCycleAtItsNextCheckpoint() {
+        withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+            guard let generation = sdk.beginSyncRun() else { return XCTFail("slot") }
+            var tightened: [Date] = []
+            sdk.registerActiveLanesCycle(ActiveLanesCycle(
+                generation: generation, requestLiveRound: { _ in true }, tighten: { tightened.append($0) }
+            ))
+            defer {
+                _ = sdk.releaseActiveLanesCycle(generation: generation)
+                sdk.finishSync(generation: generation)
+            }
+            let task = FakeTask()
+            let probe = CollectProbe(finishImmediately: false)
+            let budget = BackgroundTaskBudget(
+                deadline: Date().addingTimeInterval(25), waitCap: 30, expirationGrace: 0.3
+            )
+            sdk.runSDKBackgroundTask(task, kind: .refresh, budget: budget, collect: probe.collect)
+            spin(0.1)
+
+            task.expirationHandler?()
+
+            XCTAssertEqual(tightened.count, 1, "die Frist des Zyklus ist jetzt")
+            wait(for: [task.completed], timeout: 3)
+        }
+    }
+
     func testLanesExpirationCompletesAsSoonAsTheCycleEndsWithinTheGrace() {
         withIsolatedSDK(orchestration: .lanes) { sdk, _ in
             let task = FakeTask()

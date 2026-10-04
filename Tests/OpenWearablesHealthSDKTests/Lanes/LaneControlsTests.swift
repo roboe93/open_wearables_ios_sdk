@@ -222,6 +222,18 @@ final class LaneControlsTests: XCTestCase {
         }
     }
 
+    /// Review ME-01: Ein Observer-Lauf im Hintergrund bekommt eine Frist knapp vor dem Ende seiner
+    /// Hintergrundzeit, statt ohne Frist zu laufen und mitten im Upload suspendiert zu werden.
+    func testAnObserverRunInTheBackgroundGetsADeadlineInsideItsBackgroundTime() {
+        let now = Date(timeIntervalSince1970: 1_790_000_000)
+        XCTAssertEqual(OpenWearablesHealthSDK.observerDeadline(now: now, backgroundTimeRemaining: 30), now.addingTimeInterval(25))
+        XCTAssertEqual(OpenWearablesHealthSDK.observerDeadline(now: now, backgroundTimeRemaining: 3), now, "nie in der Vergangenheit")
+        XCTAssertEqual(
+            OpenWearablesHealthSDK.observerDeadline(now: now, backgroundTimeRemaining: .greatestFiniteMagnitude),
+            now.addingTimeInterval(295), "unbegrenzte Zeit wird gedeckelt"
+        )
+    }
+
     // MARK: - requestBackfill
 
     func testRequestBackfillQueuesATypeWithoutTouchingItsAnchor() {
