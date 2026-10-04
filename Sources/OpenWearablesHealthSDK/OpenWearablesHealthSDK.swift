@@ -935,6 +935,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     /// 0.15 signature. Runs with an internal trigger and drops the outcome.
+    ///
+    /// Fork (Plan 05-09), decided: no deadline here. This wrapper is the 0.15 entry for an
+    /// "internal" run and has no caller left in the SDK (the BGTask handlers and every trigger
+    /// use the full signature, which takes the deadline). A run started through it with
+    /// `isBackground: false` is a foreground run, and the foreground has no time limit; a caller
+    /// that declares `isBackground: true` has to use the full signature and pass its own deadline.
     internal func collectAllData(fullExport: Bool, isBackground: Bool, completion: @escaping () -> Void) {
         collectAllData(
             fullExport: fullExport, isBackground: isBackground,

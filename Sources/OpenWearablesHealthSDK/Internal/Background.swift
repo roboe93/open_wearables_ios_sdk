@@ -100,66 +100,22 @@ extension OpenWearablesHealthSDK {
         }
     }
 
+    // Fork (Plan 05-09): the two SDK-owned BGTask handlers share `runSDKBackgroundTask` in
+    // `Lanes/BackgroundTaskBudget.swift`. In upstream mode it behaves exactly like the bodies of
+    // 0.15 (no deadline, waits of 20 s and 25 s, `setTaskCompleted` when the run is back). In lanes
+    // mode the cycle gets a deadline from the task's time budget, so it cannot outlive the
+    // background time iOS grants (a terminated app is a silent outage).
     @available(iOS 13.0, *)
     internal func handleAppRefresh(task: BGAppRefreshTask) {
         journalWake(trigger: SyncTrigger.sdkRefresh.journalValue, note: nil)
         scheduleAppRefresh()
-        
-        let opQueue = OperationQueue()
-        let op = BlockOperation { [weak self] in
-            let group = DispatchGroup()
-            group.enter()
-            
-            self?.collectAllData(
-                fullExport: false, isBackground: true, trigger: .sdkRefresh, deadline: nil
-            ) { _ in
-                group.leave()
-            }
-            
-            let result = group.wait(timeout: .now() + 20)
-            if result == .timedOut {
-                self?.logMessage("BGAppRefresh sync timed out")
-            }
-        }
-
-        task.expirationHandler = {
-            self.logMessage("BGAppRefresh task expired - cancelling in-flight uploads")
-            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
-            op.cancel()
-        }
-        op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
-        opQueue.addOperation(op)
+        runSDKBackgroundTask(task, kind: .refresh)
     }
 
     @available(iOS 13.0, *)
     internal func handleProcessing(task: BGProcessingTask) {
         journalWake(trigger: SyncTrigger.sdkProcessing.journalValue, note: nil)
         scheduleProcessing()
-        
-        let opQueue = OperationQueue()
-        let op = BlockOperation { [weak self] in
-            let group = DispatchGroup()
-            group.enter()
-            
-            self?.retryOutboxIfPossible()
-            self?.collectAllData(
-                fullExport: false, isBackground: true, trigger: .sdkProcessing, deadline: nil
-            ) { _ in
-                group.leave()
-            }
-            
-            let result = group.wait(timeout: .now() + 25)
-            if result == .timedOut {
-                self?.logMessage("BGProcessing sync timed out")
-            }
-        }
-
-        task.expirationHandler = {
-            self.logMessage("BGProcessing task expired - cancelling in-flight uploads")
-            self.cancelInFlightSyncUploads(reason: "backgroundExpiration")
-            op.cancel()
-        }
-        op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
-        opQueue.addOperation(op)
+        runSDKBackgroundTask(task, kind: .processing)
     }
 }
