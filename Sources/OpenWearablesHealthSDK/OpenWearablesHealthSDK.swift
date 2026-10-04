@@ -724,8 +724,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Fork: runs one sync and reports what happened as a typed `SyncOutcome`.
     ///
     /// Replaces `syncNow(completion:)`, which 0.14 removed. The same prechecks as the
-    /// internal triggers apply: no tracked type reports `.upToDate` with zero records, no
-    /// credentials report `.failed("no auth")`. A run that finds the slot taken reports
+    /// internal triggers apply: no tracked type reports `.upToDate` with zero records in upstream
+    /// mode and `.failed("nothing tracked")` in lanes mode (fork, review LO-06), no credentials
+    /// report `.failed("no auth")`. A run that finds the slot taken reports
     /// `.skippedBusy` and does not disturb the run that holds it.
     ///
     /// - Parameters:
@@ -887,7 +888,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         completion: @escaping (SyncOutcome) -> Void
     ) {
         guard !trackedTypes.isEmpty else {
-            deliverUnstartedRun(.upToDate, trigger: trigger, completion: completion)
+            // Fork (review LO-06): in lanes mode a run without a single tracked type is not clean.
+            // Reported as `.upToDate` it fed the app's dead man's switch although nothing synced.
+            // Upstream mode keeps the 0.15 answer.
+            let status: SyncOutcome.Status = orchestration == .lanes ? .failed(Self.nothingTracked) : .upToDate
+            deliverUnstartedRun(status, trigger: trigger, completion: completion)
             return
         }
         

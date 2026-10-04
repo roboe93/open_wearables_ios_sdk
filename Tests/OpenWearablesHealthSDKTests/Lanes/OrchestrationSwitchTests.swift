@@ -624,6 +624,42 @@ final class OrchestrationSwitchTests: XCTestCase {
         }
     }
 
+    // MARK: - Nichts verfolgt ist kein sauberer Lauf (Review LO-06)
+
+    /// Leere `trackedTypes` (Konfigurationssuite nicht lesbar, Fehlkonfiguration) hießen `upToDate`:
+    /// ein SDK-BGTask meldete das als sauberen Lauf, und der Totmannschalter rückte vor, obwohl kein
+    /// einziger Typ synchronisiert wurde. Im Modus lanes ist das jetzt ein Fehlschlag.
+    func testWithoutTrackedTypesALanesRunFailsInsteadOfReportingUpToDate() {
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                withTrackedTypes([], on: sdk) {
+                    var outcome: SyncOutcome?
+                    sdk.sync(trigger: .sdkRefresh) { outcome = $0 }
+
+                    XCTAssertTrue(waitUntil { outcome != nil })
+                    XCTAssertEqual(outcome?.status, .failed("nothing tracked"))
+                    XCTAssertEqual(outcome?.orchestration, .lanes)
+                }
+            }
+        }
+    }
+
+    func testOnlyUnqueryableTypesInLanesModeFailAndReleaseTheSlot() throws {
+        try XCTSkipUnless(HKHealthStore.isHealthDataAvailable(), "HealthKit nicht verfügbar")
+        withIsolatedDefaults { _ in
+            withIsolatedSDK(orchestration: .lanes) { sdk, _ in
+                withTrackedTypes([HKCorrelationType(.bloodPressure)], on: sdk) {
+                    var outcome: SyncOutcome?
+                    sdk.sync(trigger: .network) { outcome = $0 }
+
+                    XCTAssertTrue(waitUntil { outcome != nil })
+                    XCTAssertEqual(outcome?.status, .failed("nothing tracked"))
+                    XCTAssertFalse(sdk.isSyncInProgress, "der Slot ist wieder frei")
+                }
+            }
+        }
+    }
+
     // MARK: - Ereignisse fürs Journal
 
     func testCoreEventsAreGroupedIntoOneEntryPerKindAndNeverFloodTheRing() {

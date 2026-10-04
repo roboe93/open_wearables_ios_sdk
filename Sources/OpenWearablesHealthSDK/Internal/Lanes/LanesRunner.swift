@@ -266,8 +266,10 @@ extension OpenWearablesHealthSDK {
         }
         let typeIds = getQueryableTypes().map { $0.identifier }
         guard !typeIds.isEmpty else {
+            // Review LO-06: nichts abzufragen ist kein sauberer Lauf, sonst schöbe er den
+            // Totmannschalter der App vor, obwohl kein Typ synchronisiert wurde.
             logMessage("No queryable types")
-            concludeWithoutCycle(.upToDate)
+            concludeWithoutCycle(.failed(Self.nothingTracked))
             return
         }
         logMessage("Lanes cycle (\(typeIds.count) types, trigger \(trigger.journalValue))")
@@ -427,6 +429,9 @@ extension OpenWearablesHealthSDK {
         lanesCycleLock.unlock()
         active?.tighten(now)
     }
+
+    /// Fehlertext eines lanes-Laufs ohne abfragbaren Typ (Review LO-06).
+    internal static let nothingTracked = "nothing tracked"
 
     /// Wie oft ein übergebener Auslöser nachsieht, ob sein Zyklus noch lebt (Review ME-03). `var` als
     /// Testnaht.
