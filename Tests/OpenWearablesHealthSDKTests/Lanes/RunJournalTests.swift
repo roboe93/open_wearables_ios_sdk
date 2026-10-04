@@ -180,6 +180,25 @@ final class RunJournalTests: XCTestCase {
         )
     }
 
+    /// Review LO-14: Eine zweite unlesbare Datei (Downgrade per Kabel und zurück) löscht die erste
+    /// nicht. Beide liegen beiseite, nichts wird gelöscht.
+    func testASecondUnreadableJournalDoesNotDeleteTheFirstOneSetAside() throws {
+        let directory = makeDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("journal.json")
+
+        try Data("erster Bestand".utf8).write(to: file)
+        RunJournal(directory: directory).record(entry(1))
+        try Data("zweiter Bestand".utf8).write(to: file)
+        RunJournal(directory: directory).record(entry(2))
+
+        let aside = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("journal.unreadable") }
+        XCTAssertEqual(aside.count, 2, "\(aside)")
+        let contents = try Set(aside.map { try String(contentsOf: directory.appendingPathComponent($0)) })
+        XCTAssertEqual(contents, ["erster Bestand", "zweiter Bestand"])
+    }
+
     // MARK: - Anbindung im SDK
 
     func testJournalLivesUnderTheStateDirectoryAndFollowsIt() {

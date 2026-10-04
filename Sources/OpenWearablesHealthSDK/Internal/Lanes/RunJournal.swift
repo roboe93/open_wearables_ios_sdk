@@ -191,11 +191,16 @@ internal final class RunJournal {
         return .entries(items.compactMap { $0.entry })
     }
 
-    /// Eine lesbare Datei, die kein Journal ist, wird beiseitegelegt statt überschrieben.
-    /// Es bleibt höchstens eine solche Datei stehen, die neueste.
+    /// Eine lesbare Datei, die kein Journal ist, wird beiseitegelegt statt überschrieben. Eine
+    /// frühere beiseitegelegte Datei bleibt (Review LO-14, Arbeitsregel 2): die nächste bekommt
+    /// einen Zähler im Namen (`journal.unreadable-2.json`).
     private func moveUnreadableFileAside() {
-        let aside = directory.appendingPathComponent("journal.unreadable.json")
-        try? FileManager.default.removeItem(at: aside)
+        var aside = directory.appendingPathComponent("journal.unreadable.json")
+        var counter = 1
+        while FileManager.default.fileExists(atPath: aside.path) {
+            counter += 1
+            aside = directory.appendingPathComponent("journal.unreadable-\(counter).json")
+        }
         try? FileManager.default.moveItem(at: fileURL, to: aside)
     }
 
