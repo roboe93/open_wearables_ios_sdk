@@ -164,7 +164,7 @@ final class BackfillPlanTests: XCTestCase {
 
     // MARK: Übernahme eines offenen Exports
 
-    func testAdoptOpenExportMakesEveryUnfinishedTypePendingWithItsCursor() {
+    func testAdoptOpenExportMakesEveryUnfinishedTypePending() {
         var plan = BackfillPlan.empty()
         let floor = t0.addingTimeInterval(-14 * 86_400)
         let cursor = t0.addingTimeInterval(-5 * 86_400)
@@ -177,11 +177,12 @@ final class BackfillPlanTests: XCTestCase {
             typeIds: [heartRate, bodyMass, sleep]
         )
 
-        XCTAssertEqual(plan.entries[heartRate]?.covered, cursor)
+        XCTAssertEqual(plan.entries[heartRate]?.covered, BackfillPlan.openUpperBound(t0), "der Cursor zählt nicht mehr (ME-08)")
+        XCTAssertGreaterThan(cursor, floor)
         XCTAssertEqual(plan.entries[heartRate]?.floor, floor)
         XCTAssertEqual(plan.entries[heartRate]?.origin, "adoptedExport")
         XCTAssertEqual(plan.entries[heartRate]?.state, .pending)
-        XCTAssertEqual(plan.entries[sleep]?.covered, t0, "ohne Cursor beginnt es bei jetzt")
+        XCTAssertEqual(plan.entries[sleep]?.covered, BackfillPlan.openUpperBound(t0), "ohne Cursor ebenso")
         XCTAssertNil(plan.entries[bodyMass], "ein fertiger Typ bekommt keinen Eintrag, auch wenn ein Cursor übrig ist")
     }
 
@@ -191,7 +192,46 @@ final class BackfillPlanTests: XCTestCase {
 
         plan.adoptOpenExport(completedTypes: [], olderThanCursors: [heartRate: cursor], floor: t0.addingTimeInterval(-86_400), now: t0)
 
-        XCTAssertEqual(plan.entries[heartRate]?.covered, cursor)
+        XCTAssertNotNil(plan.entries[heartRate])
+        XCTAssertEqual(plan.entries[heartRate]?.covered, BackfillPlan.openUpperBound(t0))
+    }
+
+    /// Review ME-08: Der Export des Originals liest neueste zuerst ab seiner ersten Abfrage. Was
+    /// danach mit einem Ende nach dem Cursor eingetragen wurde, holte er nie. Die Übernahme ignoriert
+    /// den Cursor deshalb: der Bereich (Cursor, Exportbeginn] geht idempotent doppelt raus, dafür
+    /// fehlt nichts zwischen Exportbeginn und Übernahme.
+    func testAdoptOpenExportIgnoresTheCursorSoNothingNewerThanItIsLost() {
+        var plan = BackfillPlan.empty()
+        let cursor = t0.addingTimeInterval(-5 * 86_400)
+
+        plan.adoptOpenExport(
+            completedTypes: [], olderThanCursors: [heartRate: cursor],
+            floor: t0.addingTimeInterval(-14 * 86_400), now: t0, typeIds: [heartRate]
+        )
+
+        let covered = plan.entries[heartRate]?.covered ?? .distantPast
+        XCTAssertGreaterThanOrEqual(covered, t0, "alles bis jetzt und darüber hinaus ist offen")
+    }
+
+    /// Review ME-08: Ein Typ, der im offenen Export schon fertig war und seinen Anchor hat, verpasst
+    /// alles, was zwischen Exportbeginn und seiner Anchor-Erfassung eingetragen wurde. Er bekommt ein
+    /// eigenes Fenster ab einer Stunde vor dem Exportbeginn (`adoptedGap`).
+    func testAdoptOpenExportCoversTheGapOfFinishedTypesSinceTheExportBegan() {
+        var plan = BackfillPlan.empty()
+        let exportStart = t0.addingTimeInterval(-2 * 86_400)
+        let floor = t0.addingTimeInterval(-14 * 86_400)
+
+        plan.adoptOpenExport(
+            completedTypes: [bodyMass, sleep], olderThanCursors: [:], floor: floor, now: t0,
+            typeIds: [bodyMass, sleep], exportStartedAt: exportStart, gapTypes: [bodyMass]
+        )
+
+        let gap = plan.entries[bodyMass]
+        XCTAssertEqual(gap?.origin, "adoptedGap")
+        XCTAssertEqual(gap?.state, .pending)
+        XCTAssertEqual(gap?.floor, exportStart.addingTimeInterval(-3_600))
+        XCTAssertEqual(gap?.covered, BackfillPlan.openUpperBound(t0))
+        XCTAssertNil(plan.entries[sleep], "ohne Anchor bootstrappt der Kern ihn ohnehin")
     }
 
     func testAdoptOpenExportLeavesExistingEntriesUntouchedAndIsIdempotent() {

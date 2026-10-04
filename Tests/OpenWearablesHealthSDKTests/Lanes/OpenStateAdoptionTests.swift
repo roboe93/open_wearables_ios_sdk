@@ -109,11 +109,16 @@ final class OpenStateAdoptionTests: XCTestCase {
 
             XCTAssertTrue(result.adopted)
             XCTAssertTrue(result.fullExport)
-            XCTAssertEqual(Set(result.plannedTypes), [heartRate, steps])
+            XCTAssertEqual(Set(result.plannedTypes), [heartRate, steps, bodyMass])
             let entries = h.backfill.plan.entries
-            XCTAssertEqual(Set(entries.keys), [heartRate, steps], "das fertige Gewicht bekommt keinen Eintrag")
-            XCTAssertEqual(entries[heartRate]?.covered, LaneTime.ceil(olderThanHeartRate))
-            XCTAssertEqual(entries[steps]?.covered, LaneTime.ceil(olderThanSteps))
+            // ME-08: das fertige Gewicht hat einen Anchor und verpasste, was seit dem Exportbeginn
+            // eingetragen wurde: es bekommt ein Fenster ab einer Stunde vor dem Exportbeginn.
+            XCTAssertEqual(Set(entries.keys), [heartRate, steps, bodyMass])
+            XCTAssertEqual(entries[bodyMass]?.origin, "adoptedGap")
+            XCTAssertEqual(entries[bodyMass]?.floor, now.addingTimeInterval(-3_600))
+            // ME-08: der Cursor des Exports zählt nicht, das Fenster reicht bis über jetzt hinaus.
+            XCTAssertEqual(entries[heartRate]?.covered, BackfillPlan.openUpperBound(now))
+            XCTAssertEqual(entries[steps]?.covered, BackfillPlan.openUpperBound(now))
             XCTAssertEqual(entries[heartRate]?.state, .pending)
             XCTAssertEqual(entries[heartRate]?.origin, "adoptedExport")
 
@@ -142,7 +147,7 @@ final class OpenStateAdoptionTests: XCTestCase {
 
             let entry = h.backfill.plan.entries[bodyMass]
             XCTAssertNotNil(entry)
-            XCTAssertEqual(entry?.covered, LaneTime.ceil(now), "ohne Cursor beginnt das Nachholen bei jetzt")
+            XCTAssertEqual(entry?.covered, BackfillPlan.openUpperBound(now), "ohne Cursor: offen ab jetzt")
             XCTAssertEqual(entry?.origin, "adoptedExport")
         }
     }
@@ -159,7 +164,7 @@ final class OpenStateAdoptionTests: XCTestCase {
 
             XCTAssertEqual(h.cursors.anchor(for: heartRate), existing)
             XCTAssertFalse(result.anchorsForNow.contains(heartRate))
-            XCTAssertEqual(h.backfill.plan.entries[heartRate]?.covered, LaneTime.ceil(olderThanHeartRate))
+            XCTAssertEqual(h.backfill.plan.entries[heartRate]?.covered, BackfillPlan.openUpperBound(now))
         }
     }
 

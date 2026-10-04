@@ -101,7 +101,7 @@ struct BackfillEntry: Codable, Equatable {
     /// nächste Abfrage reicht bis `covered` inklusive und filtert sie wieder heraus.
     var boundaryIds: [String]
     var state: State
-    /// `bootstrap`, `adoptedExport`, `reload`.
+    /// `bootstrap`, `adoptedExport`, `adoptedGap`, `request`, `reload`.
     var origin: String
 }
 
@@ -187,19 +187,32 @@ struct BackfillPlan: Codable, Equatable {
         entries[typeId] = entry
     }
 
-    /// Übernimmt einen offenen Export des Upstream-Ablaufs: jeder nicht fertige Typ wird
-    /// `pending` mit `covered = olderThan ?? now`, Herkunft `adoptedExport`. Fertige Typen
-    /// bekommen keinen Eintrag. Bestehende Einträge bleiben unberührt (idempotent, Fortschritt
-    /// wird nie überschrieben).
+    /// Übernimmt einen offenen Export des Upstream-Ablaufs: jeder nicht fertige Typ wird `pending`
+    /// mit offener Obergrenze ab `now`, Herkunft `adoptedExport`. Fertige Typen bekommen keinen
+    /// Eintrag, außer sie stehen in `gapTypes`. Bestehende Einträge bleiben unberührt (idempotent,
+    /// Fortschritt wird nie überschrieben).
     ///
-    /// - Parameter typeIds: alle Typen des offenen Exports. Ohne sie kennt die Übernahme nur
-    ///   Typen mit Cursor und verlöre Typen, die der Export noch gar nicht begonnen hatte.
+    /// Review ME-08: Der Export liest neueste zuerst ab seiner ersten Abfrage. Was danach mit einem
+    /// Ende nach seinem Cursor eingetragen wurde, holte er nie. Die Übernahme ignoriert den Cursor
+    /// deshalb (`olderThanCursors` nennt nur noch die Typen): der Bereich (Cursor, Exportbeginn]
+    /// geht idempotent doppelt raus, dafür fehlt nichts zwischen Exportbeginn und Übernahme.
+    ///
+    /// - Parameters:
+    ///   - typeIds: alle Typen des offenen Exports. Ohne sie kennt die Übernahme nur Typen mit
+    ///     Cursor und verlöre Typen, die der Export noch gar nicht begonnen hatte.
+    ///   - exportStartedAt: Beginn des offenen Exports (`SyncState.createdAt`).
+    ///   - gapTypes: fertige Typen, die schon einen Anchor haben. Sie verpassten, was zwischen
+    ///     Exportbeginn und ihrer Anchor-Erfassung eingetragen wurde, und bekommen ein Fenster ab
+    ///     einer Stunde vor dem Exportbeginn (Herkunft `adoptedGap`). Fertige Typen ohne Anchor
+    ///     bootstrappt der Kern ohnehin über das ganze Sync-Fenster.
     mutating func adoptOpenExport(
         completedTypes: Set<String>,
         olderThanCursors: [String: Date],
         floor: Date,
         now: Date,
-        typeIds: [String] = []
+        typeIds: [String] = [],
+        exportStartedAt: Date? = nil,
+        gapTypes: Set<String> = []
     ) {
         var candidates = Set(olderThanCursors.keys)
         candidates.formUnion(typeIds)
@@ -208,11 +221,24 @@ struct BackfillPlan: Codable, Equatable {
         for typeId in candidates.sorted() where entries[typeId] == nil {
             entries[typeId] = BackfillEntry(
                 floor: LaneTime.floor(floor),
-                covered: LaneTime.ceil(olderThanCursors[typeId] ?? now),
+                covered: Self.openUpperBound(now),
                 startedAt: LaneTime.round(now),
                 boundaryIds: [],
                 state: .pending,
                 origin: "adoptedExport"
+            )
+        }
+
+        guard let exportStartedAt = exportStartedAt else { return }
+        let gapFloor = max(floor, exportStartedAt.addingTimeInterval(-3_600))
+        for typeId in gapTypes.intersection(completedTypes).sorted() where entries[typeId] == nil {
+            entries[typeId] = BackfillEntry(
+                floor: LaneTime.floor(gapFloor),
+                covered: Self.openUpperBound(now),
+                startedAt: LaneTime.round(now),
+                boundaryIds: [],
+                state: .pending,
+                origin: "adoptedGap"
             )
         }
     }

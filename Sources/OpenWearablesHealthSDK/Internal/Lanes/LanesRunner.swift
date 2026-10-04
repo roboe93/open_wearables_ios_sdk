@@ -594,10 +594,11 @@ extension OpenWearablesHealthSDK {
     /// Übernimmt eine offene Sitzung des Original-Ablaufs, wenn der Zyklus im Modus lanes beginnt
     /// (Wechsel `upstream → lanes`, T-05-30). Nichts wird gelöscht, nichts abgebrochen.
     ///
-    /// - Offener Export (`fullExport`): jeder nicht fertige Typ wird ein Nachhol-Eintrag mit
-    ///   `covered` am Cursor des Exports (`BackfillPlan.adoptOpenExport`). Typen des Exports ohne
-    ///   Anchor bekommen den Anchor für jetzt (der Kern bootstrappt sie nicht, siehe 05-06:
-    ///   `noAnchor`), sonst bliebe ihre Live-Spur für immer aus.
+    /// - Offener Export (`fullExport`): jeder nicht fertige Typ wird ein Nachhol-Eintrag mit offener
+    ///   Obergrenze ab jetzt, der Cursor des Exports zählt nicht (`BackfillPlan.adoptOpenExport`,
+    ///   Review ME-08). Fertige Typen mit Anchor bekommen ein Fenster ab dem Exportbeginn
+    ///   (`adoptedGap`). Typen des Exports ohne Anchor bekommen den Anchor für jetzt (der Kern
+    ///   bootstrappt sie nicht, siehe 05-06: `noAnchor`), sonst bliebe ihre Live-Spur für immer aus.
     /// - Offene inkrementelle Sitzung: der bestätigte Fortschritt (`pendingAnchorData`, nur nach 2xx
     ///   geschrieben) wird der Anchor des Typs, genau wie das Original ihn beim Abschluss des Typs
     ///   festschriebe.
@@ -658,6 +659,8 @@ extension OpenWearablesHealthSDK {
             if let cursor = progress.pendingOlderThan { olderThan[typeId] = cursor }
         }
         let floor = syncStartDate() ?? now.addingTimeInterval(-Double(lanesDaysBack()) * 86_400)
+        // ME-08: fertige Typen mit Anchor verpassten, was seit dem Exportbeginn eingetragen wurde.
+        let gapTypes = Set(typeIds.filter { completed.contains($0) && cursors.anchor(for: $0) != nil })
         var existingTypes: Set<String> = []
         let plan: BackfillPlan
         do {
@@ -668,7 +671,9 @@ extension OpenWearablesHealthSDK {
                     olderThanCursors: olderThan,
                     floor: floor,
                     now: now,
-                    typeIds: typeIds
+                    typeIds: typeIds,
+                    exportStartedAt: state.createdAt,
+                    gapTypes: gapTypes
                 )
             }
         } catch {
