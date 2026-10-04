@@ -390,7 +390,10 @@ extension OpenWearablesHealthSDK {
 
     /// Ende eines Laufs. `protectedStart` ist der Sperrzustand bei Beginn, der Wert bei
     /// Ende kommt aus dem Cache.
-    internal func journalRun(_ outcome: SyncOutcome, protectedStart: Bool?) {
+    ///
+    /// `note` (Plan 05-08) trägt die Ereignisse des Kerns, die keinen eigenen Eintrag haben
+    /// (gesperrt, Lesefehler), als Kurznamen. Der Upstream-Pfad übergibt keinen.
+    internal func journalRun(_ outcome: SyncOutcome, protectedStart: Bool?, note: String? = nil) {
         runJournal.record(SyncJournalEntry(
             at: outcome.finished,
             kind: JournalKind.run,
@@ -408,7 +411,7 @@ extension OpenWearablesHealthSDK {
             leaseTakenOver: outcome.leaseTakenOver,
             bgRefresh: backgroundRefreshStatusCache,
             durationMs: max(0, Int(outcome.finished.timeIntervalSince(outcome.started) * 1000)),
-            note: nil
+            note: note
         ))
     }
 }

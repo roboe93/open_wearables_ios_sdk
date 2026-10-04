@@ -213,8 +213,9 @@ extension OpenWearablesHealthSDK {
         // or in progress; apps can use this to show a "keep the app open" hint.
         let initialExportDone = isInitialExportDone()
         
+        var status: [String: Any]
         if let state = loadSyncState() {
-            return [
+            status = [
                 "hasResumableSession": state.hasProgress,
                 "sentCount": state.totalSentCount,
                 "completedTypes": state.completedTypes.count,
@@ -224,7 +225,7 @@ extension OpenWearablesHealthSDK {
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
-            return [
+            status = [
                 "hasResumableSession": false,
                 "sentCount": 0,
                 "completedTypes": 0,
@@ -234,6 +235,15 @@ extension OpenWearablesHealthSDK {
                 "createdAt": NSNull()
             ]
         }
+        
+        // Fork (Plan 05-08): additive keys, the ones above are unchanged.
+        let queue = makeDeletionQueue().stats()
+        status["orchestration"] = orchestration.rawValue
+        status["backfillPendingTypes"] = lanesBackfillPendingTypeCount()
+        status["needsCatchUp"] = lanesNeedsCatchUp
+        status["deletionsQueued"] = queue.total
+        status["deletionsUnsent"] = queue.unsent
+        return status
     }
     
     internal func loadSyncSession() -> SyncState? {

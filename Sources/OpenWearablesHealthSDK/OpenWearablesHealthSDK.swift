@@ -242,6 +242,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return sessionEpoch
     }
     
+    // Fork (Plan 05-08): the running two-lane cycle, as far as other triggers need it, and the
+    // triggers that arrived while it was ending. Both guarded by `lanesCycleLock`. The types
+    // and the functions that use them live in `Lanes/LanesRunner.swift`.
+    internal var activeLanesCycle: ActiveLanesCycle?
+    internal var deferredLanesTriggers: [DeferredLanesTrigger] = []
+    internal let lanesCycleLock = NSLock()
+    
     // Fork: statistics per run, filled by the places that know why a run ended and
     // read once when the outcome is built. See `Lanes/RunStats.swift`.
     internal var runStatsByGeneration: [Int: RunStats] = [:]
@@ -779,6 +786,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         scheduleAppRefresh()
         scheduleProcessing()
         
+        // Fork (Plan 05-08): lanes mode resumes when a catch-up is owed, a backfill is open or an
+        // open session of the original flow is waiting to be taken over.
+        if orchestration == .lanes {
+            if lanesHasWorkToResume() {
+                logMessage("Found open lanes work, will resume...")
+                syncAll(fullExport: false, trigger: .restore) { _ in
+                    self.logMessage("Resumed sync completed")
+                }
+            }
+            logMessage("Background sync auto-restored")
+            return
+        }
+        
         // Resume when there is a session with progress, but also when the initial
         // full export never completed (e.g. it was interrupted before its first
         // successful upload - such a session has no progress to detect).
@@ -863,7 +883,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     internal func triggerCombinedSync(typeIdentifier: String? = nil) {
-        if isInitialSyncInProgress {
+        // Fork (Plan 05-08): in lanes mode there is no initial export that holds new data back;
+        // a wake is never dropped for that reason. The upstream branch is unchanged.
+        if isInitialSyncInProgress && orchestration != .lanes {
             logMessage("Skipping - initial sync in progress")
             // Fork: the wake itself is the measurement, even if the run is dropped.
             journalWake(
@@ -910,12 +932,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         ) { _ in completion() }
     }
     
-    /// The one collection point for every trigger. Delivers exactly one `SyncOutcome`:
-    /// first through `onRunCompleted`, then through `completion`, on the main queue.
+    /// The flow of 0.15, the way back (D-13). Since Plan 05-08 `collectAllData(...)` in
+    /// `Lanes/LanesRunner.swift` is the one switch that decides per call between this and the
+    /// two-lane cycle; this body is unchanged from before the switch existed.
     ///
-    /// The flow itself is unchanged from 0.15. The outcome is built from `RunStats`, which
-    /// the places that know why a run ended fill in (locked, rejected, background time).
-    internal func collectAllData(
+    /// Delivers exactly one `SyncOutcome`: first through `onRunCompleted`, then through
+    /// `completion`, on the main queue. The outcome is built from `RunStats`, which the places
+    /// that know why a run ended fill in (locked, rejected, background time).
+    internal func collectAllDataUpstream(
         fullExport: Bool,
         isBackground: Bool,
         trigger: SyncTrigger,
@@ -1085,9 +1109,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal func deliverRun(
         _ outcome: SyncOutcome,
         protectedStart: Bool?,
+        note: String? = nil,
         completion: @escaping (SyncOutcome) -> Void
     ) {
-        journalRun(outcome, protectedStart: protectedStart)
+        journalRun(outcome, protectedStart: protectedStart, note: note)
         DispatchQueue.main.async {
             self.onRunCompleted?(outcome)
             completion(outcome)
@@ -1103,7 +1128,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     ) {
         let now = Date()
         deliverRun(
-            SyncOutcome(status: status, orchestration: .upstream, trigger: trigger, started: now, finished: now),
+            // Fork: the mode that would have run, not always `.upstream`.
+            SyncOutcome(status: status, orchestration: orchestration, trigger: trigger, started: now, finished: now),
             protectedStart: protectedDataAvailableCache,
             completion: completion
         )
@@ -1136,7 +1162,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// network resumes all run with `isBackground: false` while the app is suspended
     /// or about to be, and a 2000-record round is ~1.3 MB - too much for a ~30s task
     /// assertion. Re-checked every round because the app can change state mid-sync.
-    private func currentChunkLimit(declaredBackground: Bool) -> Int {
+    ///
+    /// Fork (Plan 05-08): `internal` instead of `private`, the lanes runner needs it for
+    /// `CycleContext.chunkLimit`.
+    internal func currentChunkLimit(declaredBackground: Bool) -> Int {
         let inBackground = declaredBackground || backgroundTimeRemainingIfInBackground() != nil
         return inBackground ? backgroundChunkSize : recordsPerChunk
     }
@@ -1691,6 +1720,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         return generation
     }
 
+    /// Fork (Plan 05-08): what `beginSyncRun()` would decide right now, without taking the slot.
+    /// The lanes runner asks it to find out whether a running cycle is still alive (then a
+    /// trigger requests a live round instead of being skipped).
+    internal func currentLeaseDecision() -> SyncLease.Decision {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return SyncLease.decide(
+            isSyncing: isSyncing, cancelRequestedAt: cancelRequestedAt,
+            leaseDeadline: leaseDeadlineStorage, now: now()
+        )
+    }
+
     /// Fork: a sign of life from the run that owns the slot. Pushes the lease out by
     /// `SyncLease.leaseDuration`. A run that has already lost the slot extends nothing, so
     /// a late callback of a superseded run cannot keep a newer run's slot alive.
@@ -2091,8 +2132,24 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             self.logMessage("Device unlocked - protected data available")
             self.journalWake(
                 trigger: SyncTrigger.unlock.journalValue,
-                note: "pendingSync=\(self.pendingSyncAfterUnlock)"
+                note: "pendingSync=\(self.pendingSyncAfterUnlock) catchUp=\(self.lanesNeedsCatchUp)"
             )
+            
+            // Fork (Plan 05-08): lanes mode owes a catch-up from the persisted flag (it survives a
+            // process restart, `pendingSyncAfterUnlock` does not). A cycle that is running takes the
+            // request as a live round, so there is no "already syncing" check here.
+            if self.orchestration == .lanes {
+                self.pendingSyncAfterUnlock = false
+                if self.lanesNeedsCatchUp {
+                    self.logMessage("Triggering catch-up after unlock...")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.syncAll(fullExport: false, trigger: .unlock) { _ in
+                            self?.logMessage("Catch-up after unlock completed")
+                        }
+                    }
+                }
+                return
+            }
             
             if self.pendingSyncAfterUnlock {
                 self.pendingSyncAfterUnlock = false
@@ -2165,6 +2222,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             guard OpenWearablesHealthSdkKeychain.isSyncActive(), self.hasAuth else { return }
             
+            // Fork (Plan 05-08): lanes mode, a running cycle takes the trigger as a live round.
+            if self.orchestration == .lanes {
+                guard self.lanesHasWorkToResume() else { return }
+                self.logMessage("App returned to foreground - resuming lanes sync...")
+                self.syncAll(fullExport: false, trigger: .foreground) { _ in
+                    self.logMessage("Foreground resume sync completed")
+                }
+                return
+            }
+            
             let fullDone = self.isInitialExportDone()
             guard self.hasResumableSyncSession() || !fullDone else { return }
             
@@ -2187,6 +2254,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private func tryResumeAfterNetworkRestored() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self = self else { return }
+            
+            // Fork (Plan 05-08): lanes mode, a running cycle takes the trigger as a live round.
+            if self.orchestration == .lanes {
+                guard self.lanesHasWorkToResume() else {
+                    self.logMessage("No sync to resume")
+                    return
+                }
+                self.logMessage("Resuming lanes sync after network restored...")
+                self.syncAll(fullExport: false, trigger: .network) { _ in
+                    self.logMessage("Network resume sync completed")
+                }
+                return
+            }
             
             let fullDone = self.isInitialExportDone()
             guard self.hasResumableSyncSession() || !fullDone else {

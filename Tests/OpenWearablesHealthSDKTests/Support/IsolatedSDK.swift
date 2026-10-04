@@ -12,11 +12,18 @@ extension XCTestCase {
     /// run hermetic: without them it would read and delete the Application Support
     /// contents of whatever app hosts it, and it could not hold a credential at all,
     /// because `xctest` has no keychain access group.
+    ///
+    /// Fork (Plan 05-08): seit `0.15.0-ow.2` ist `lanes` der Standard der Weiche. Die Tests aus
+    /// der Zeit davor prüfen den Ablauf des Originals und laufen deshalb mit `.upstream`
+    /// (der Vorgabewert). Tests der Zwei-Spuren-Steuerung geben `.lanes` an; `nil` schreibt
+    /// nichts, dann gilt, was die Suite hergibt (fehlender Schlüssel = lanes). Der Schlüssel
+    /// wird direkt gesetzt und danach zurückgestellt, der Setter würde einen Lauf abbrechen.
     func withIsolatedSDK(
         userId: String = "test-user",
         accessToken: String? = "access-1",
         refreshToken: String? = "refresh-1",
         host: String = "https://sync.example.test",
+        orchestration: SyncOrchestration? = .upstream,
         _ body: (OpenWearablesHealthSDK, URL) throws -> Void
     ) rethrows {
         let sdk = OpenWearablesHealthSDK.shared
@@ -28,6 +35,8 @@ extension XCTestCase {
         let previousCredentials = OpenWearablesHealthSdkKeychain.volatileStore
         let previousPersistedHost = OpenWearablesHealthSdkKeychain.getHost()
         let previousRefreshUrl = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
+        let pinnedDefaults = sdk.defaults
+        let previousOrchestration = pinnedDefaults.object(forKey: "lanes.orchestration")
 
         let stateDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ow-sdk-tests-\(UUID().uuidString)", isDirectory: true)
@@ -37,6 +46,13 @@ extension XCTestCase {
         configuration.protocolClasses = [StubURLProtocol.self]
 
         defer {
+            if orchestration != nil {
+                if let previousOrchestration = previousOrchestration {
+                    pinnedDefaults.set(previousOrchestration, forKey: "lanes.orchestration")
+                } else {
+                    pinnedDefaults.removeObject(forKey: "lanes.orchestration")
+                }
+            }
             StubURLProtocol.reset()
             sdk.onAuthError = previousAuthErrorHandler
             sdk.foregroundSession = previousSession
@@ -48,6 +64,9 @@ extension XCTestCase {
             try? FileManager.default.removeItem(at: stateDirectory)
         }
 
+        if let orchestration = orchestration {
+            pinnedDefaults.set(orchestration.rawValue, forKey: "lanes.orchestration")
+        }
         sdk.stateDirectoryOverride = stateDirectory
         sdk.foregroundSession = URLSession(
             configuration: configuration, delegate: nil, delegateQueue: .main

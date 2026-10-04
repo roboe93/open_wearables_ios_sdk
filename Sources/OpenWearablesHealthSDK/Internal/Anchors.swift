@@ -64,6 +64,15 @@ extension OpenWearablesHealthSDK {
             return
         }
         
+        // Fork (Plan 05-08): in lanes mode the start is a cycle like any other. Types without an
+        // anchor get their anchor for now and a backfill; there is no initial export that
+        // would set `isInitialSyncInProgress` and hold new data back.
+        if orchestration == .lanes {
+            logMessage("Lanes sync kickoff")
+            syncAll(fullExport: false, trigger: .kickoff, completion: { _ in completion(true) })
+            return
+        }
+        
         let fullDone = isInitialExportDone()
         if fullDone {
             logMessage("Incremental sync")
