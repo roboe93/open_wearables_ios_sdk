@@ -199,6 +199,11 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
     private func start(_ run: CycleRun) {
         run.context.heartbeat()
 
+        // Der Plan wird zuerst geladen, auch wenn der Lauf gleich endet: das Ergebnis meldet sonst
+        // "nichts offen", obwohl nur nicht nachgesehen wurde. Das Laden ist eine lokale Datei, kein
+        // Zugriff auf HealthKit oder den Server.
+        run.plan = backfill.load()
+
         if run.context.isCancelled() {
             cancel(run)
             finish(run)
@@ -213,7 +218,6 @@ final class SyncCore<Reader: HealthReading, Sink: Delivering> where Reader.Item 
             return
         }
 
-        run.plan = backfill.load()
         bootstrap(run, types: run.stageA + run.stageB, index: 0) { [self] in
             guard run.stop == nil else {
                 finish(run)

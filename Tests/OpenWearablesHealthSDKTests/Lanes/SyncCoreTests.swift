@@ -326,6 +326,22 @@ final class SyncCoreTests: XCTestCase {
         XCTAssertEqual(result.records, 0)
     }
 
+    func testALockedCycleStillReportsAnOpenBackfillInsteadOfHidingIt() {
+        let h = LaneHarness()
+        var plan = BackfillPlan.empty()
+        plan.start(typeId: heartRate, now: h.clock.now(), daysBack: 14, origin: "bootstrap")
+        h.store.plan = plan
+        h.protectedDataAvailable = false
+
+        let result = h.run(h.context([heartRate]))
+
+        XCTAssertEqual(result.status, .deferredLocked)
+        XCTAssertTrue(result.backfillPending, "was offen ist, bleibt sichtbar, auch wenn der Lauf nichts lesen durfte")
+        XCTAssertEqual(h.reader.totalCalls, 0)
+        XCTAssertEqual(h.store.saveCount, 0)
+        XCTAssertEqual(h.store.plan, plan, "der Plan bleibt unberührt")
+    }
+
     func testLockedInTheMiddleKeepsTheAcceptedTypeCommitted() {
         let h = LaneHarness()
         h.presetAnchors([weight, heartRate])
