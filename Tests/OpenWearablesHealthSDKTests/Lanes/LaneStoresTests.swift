@@ -155,6 +155,27 @@ final class LaneStoresTests: XCTestCase {
         }
     }
 
+    /// `save` ohne vorheriges `load`: eine beschädigte Datei wird trotzdem nie unbemerkt ersetzt.
+    func testSavingOverACorruptFileKeepsItsContentAsideEvenWithoutAPriorLoad() throws {
+        try withIsolatedSDK { sdk, directory in
+            let folder = directory.appendingPathComponent("health_lanes", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let garbage = Data("kaputt".utf8)
+            try garbage.write(to: folder.appendingPathComponent("backfill.json"))
+
+            var plan = BackfillPlan.empty()
+            plan.start(typeId: heartRate, now: epoch, daysBack: 14, origin: "bootstrap")
+            try sdk.makeBackfillStore().save(plan)
+
+            let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            let asides = names.filter { $0.hasPrefix("backfill.json.corrupt-") }
+            XCTAssertEqual(asides.count, 1, "\(names)")
+            guard let aside = asides.first else { return }
+            XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent(aside)), garbage)
+            XCTAssertEqual(sdk.makeBackfillStore().load(), plan)
+        }
+    }
+
     /// Eine Datei, die da ist, sich aber nicht lesen lässt, ist nicht beschädigt. Sie bleibt, und
     /// `save` überschreibt sie nicht mit einem Plan, der den echten Stand nicht kennt.
     func testAnUnreadableBackfillFileIsNeverOverwritten() throws {
