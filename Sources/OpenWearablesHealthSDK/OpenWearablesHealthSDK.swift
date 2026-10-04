@@ -228,6 +228,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // target them instead of every task on the shared foreground session (which also
     // carries token refreshes and telemetry).
     private var syncUploadTasks: [String: URLSessionTask] = [:]
+    /// Fork (review ME-02): one heartbeat per tracked upload of a run, keyed like `syncUploadTasks`.
+    private var syncUploadHeartbeats: [String: UploadProgressHeartbeat] = [:]
     private let syncUploadTasksLock = NSLock()
     
     /// Why the last upload cancellation was issued, so an `NSURLErrorCancelled` in the
@@ -1834,17 +1836,35 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     // MARK: - Sync-owned upload tracking
     
-    internal func trackSyncUpload(_ task: URLSessionTask, requestId: String) {
+    /// Fork (review ME-02): with a `generation`, the upload gives the run's lease a sign of life
+    /// whenever bytes moved since the last look, so a slow but live upload is never taken over.
+    internal func trackSyncUpload(_ task: URLSessionTask, requestId: String, generation: Int? = nil) {
+        var heartbeat: UploadProgressHeartbeat?
+        if let generation = generation {
+            heartbeat = UploadProgressHeartbeat(
+                interval: Self.uploadHeartbeatInterval,
+                progress: { [weak task] in
+                    guard let task = task else { return (false, 0) }
+                    return (task.state == .running, task.countOfBytesSent + task.countOfBytesReceived)
+                },
+                beat: { [weak self] in self?.heartbeat(generation: generation) }
+            )
+        }
         syncUploadTasksLock.lock()
         syncUploadTasks[requestId] = task
+        if let heartbeat = heartbeat { syncUploadHeartbeats[requestId] = heartbeat }
         syncUploadTasksLock.unlock()
+        heartbeat?.start()
     }
     
     @discardableResult
     internal func untrackSyncUpload(requestId: String) -> URLSessionTask? {
         syncUploadTasksLock.lock()
-        defer { syncUploadTasksLock.unlock() }
-        return syncUploadTasks.removeValue(forKey: requestId)
+        let heartbeat = syncUploadHeartbeats.removeValue(forKey: requestId)
+        let task = syncUploadTasks.removeValue(forKey: requestId)
+        syncUploadTasksLock.unlock()
+        heartbeat?.stop()
+        return task
     }
     
     /// Cancels the uploads the sync path owns. Called from BG task expiration handlers

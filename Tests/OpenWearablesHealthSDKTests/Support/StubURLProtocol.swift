@@ -12,6 +12,10 @@ final class StubURLProtocol: URLProtocol {
         let status: Int
         let body: Data
         let error: Error?
+        /// Fork (review ME-02): the body arrives in this many pieces, one per `trickleInterval`, so
+        /// the task stays in flight while bytes keep moving, like a slow mobile upload.
+        var trickleChunks = 0
+        var trickleInterval: TimeInterval = 0
 
         static func status(_ code: Int, _ json: String = "{}") -> Reply {
             Reply(status: code, body: Data(json.utf8), error: nil)
@@ -19,6 +23,10 @@ final class StubURLProtocol: URLProtocol {
 
         static func failure(_ error: Error) -> Reply {
             Reply(status: 0, body: Data(), error: error)
+        }
+
+        static func trickle(_ code: Int, chunks: Int, every interval: TimeInterval) -> Reply {
+            Reply(status: code, body: Data(), error: nil, trickleChunks: chunks, trickleInterval: interval)
         }
 
         /// Never responds, leaving the task in flight until something cancels it.
@@ -110,11 +118,32 @@ final class StubURLProtocol: URLProtocol {
         }
 
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if reply.trickleChunks > 0 {
+            var remaining = reply.trickleChunks
+            let timer = Timer(timeInterval: reply.trickleInterval, repeats: true) { [weak self] timer in
+                guard let self = self else { timer.invalidate(); return }
+                if remaining > 0 {
+                    remaining -= 1
+                    self.client?.urlProtocol(self, didLoad: Data(repeating: 0x20, count: 64))
+                } else {
+                    timer.invalidate()
+                    self.client?.urlProtocolDidFinishLoading(self)
+                }
+            }
+            trickleTimer = timer
+            RunLoop.current.add(timer, forMode: .common)
+            return
+        }
         client?.urlProtocol(self, didLoad: reply.body)
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    private var trickleTimer: Timer?
+
+    override func stopLoading() {
+        trickleTimer?.invalidate()
+        trickleTimer = nil
+    }
 
     /// `URLSession` turns `httpBody` into a stream before the protocol sees the request.
     private static func readBody(from request: URLRequest) -> Data {

@@ -15,9 +15,11 @@ import Foundation
 enum SyncLease {
 
     /// Frist ohne Lebenszeichen. 150 Sekunden liegen über dem Request-Timeout der Vordergrund-Session
-    /// (120 Sekunden). Eine kürzere Frist übernähme einen legitim langsamen Upload und verwürfe dessen
-    /// Chunk (Recherche, Pitfall 5). Im Hintergrund begrenzt ohnehin die Hintergrundzeit den Lauf.
-    /// Der Wert ist eine Annahme und gehört am Gerät nachgemessen (Szenario "hängende Sperre").
+    /// (120 Sekunden), das aber ein Leerlauf-Timeout ist: ein Upload, der Daten bewegt, darf bis zum
+    /// Resource-Timeout (600 Sekunden) laufen. Deshalb gibt ein laufender Upload selbst Lebenszeichen,
+    /// solange Bytes fließen (`UploadProgressHeartbeat`, Review ME-02); ein hängender Upload tut es
+    /// nicht. Im Hintergrund begrenzt ohnehin die Hintergrundzeit den Lauf. Der Wert ist eine Annahme
+    /// und gehört am Gerät nachgemessen (Szenario "hängende Sperre").
     static let leaseDuration: TimeInterval = 150
 
     /// Wie lange ein abgebrochener Lauf den Slot noch halten darf, bevor der nächste ihn übernimmt.

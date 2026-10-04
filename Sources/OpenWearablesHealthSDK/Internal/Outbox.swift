@@ -187,7 +187,7 @@ extension OpenWearablesHealthSDK {
             }
         }
         
-        trackSyncUpload(task, requestId: requestId)
+        trackSyncUpload(task, requestId: requestId, generation: generation)
         task.resume()
     }
     
@@ -277,7 +277,7 @@ extension OpenWearablesHealthSDK {
                     }
                 }
                 
-                self.trackSyncUpload(retryTask, requestId: retryKey)
+                self.trackSyncUpload(retryTask, requestId: retryKey, generation: generation)
                 retryTask.resume()
                 
             case .authFailure:
