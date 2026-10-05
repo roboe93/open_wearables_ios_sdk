@@ -33,6 +33,37 @@ extension OpenWearablesHealthSDK {
         return stateBaseDirectory().appendingPathComponent("health_outbox", isDirectory: true)
     }
 
+    /// Fork (Plan 09-03, Gerätebefund 05.10.2026): wo eine Datei aus einem Outbox-Item heute liegt.
+    ///
+    /// Items aus SDK 0.13 tragen absolute Pfade. Nach einer Neuinstallation hat der App-Container
+    /// eine neue UUID, die Pfade zeigen ins Leere, die Dateien liegen aber unter gleichem Namen in
+    /// `outboxDir()`. Bisher galt das Item dann als verwaist: es wurde gelöscht, die Ladung blieb für
+    /// immer liegen.
+    ///
+    /// - Existiert `path`, gilt er unverändert (Verhalten wie bisher).
+    /// - Sonst zählt nur der letzte Bestandteil: dieselbe Datei in `outboxDir()`, wenn sie dort als
+    ///   reguläre Datei liegt. `.`, `..` und Ordner werden nie aufgelöst, das Ergebnis verlässt
+    ///   `outboxDir()` nie (T-09-07). Ein `..` am Ende bezeichnete sonst den Zustandsordner, und das
+    ///   Verwerfen einer alten Altlast löschte ihn.
+    /// - Sonst `nil`.
+    internal func resolveOutboxPath(_ path: String) -> String? {
+        guard !path.isEmpty else { return nil }
+        if FileManager.default.fileExists(atPath: path) { return path }
+
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { return nil }
+
+        let directory = outboxDir()
+        let candidate = directory.appendingPathComponent(name, isDirectory: false)
+        guard candidate.standardizedFileURL.deletingLastPathComponent().path
+                == directory.standardizedFileURL.path else { return nil }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+        return candidate.path
+    }
+
     // MARK: - Combined upload
     
     /// Uploads one combined sync round.
@@ -330,21 +361,41 @@ extension OpenWearablesHealthSDK {
             return
         }
         
+        // Fork (Plan 09-03): Ein Anchor aus einer Outbox-Datei wird nur gespeichert, wenn es für
+        // (Typ, Nutzer) noch keinen gibt. Seit 0.14 schreibt nichts mehr in die Outbox, jede Datei
+        // dort ist also älter als der heutige Anchor. Ihn zu überschreiben, setzte den Anchor zurück
+        // und löste beim nächsten Lauf eine Flut aus (ROADMAP: Anchors werden nie zurückgesetzt).
+        // Die Ladung selbst geht trotzdem hinaus; eine erneute Zustellung ist harmlos, der Server
+        // führt Upserts über Quelle, Typ und Zeitpunkt.
         if let anchorPath = anchorPath, !anchorPath.isEmpty {
+            var saved = 0
+            var kept = 0
+            let saveIfAbsent = { (anchorData: Data, typeId: String) in
+                let key = self.anchorKey(typeIdentifier: typeId, userKey: item.userKey)
+                if self.defaults.data(forKey: key) != nil {
+                    kept += 1
+                } else {
+                    self.saveAnchorData(anchorData, typeIdentifier: typeId, userKey: item.userKey)
+                    saved += 1
+                }
+            }
             if item.typeIdentifier == "combined" {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)),
                    let anchorsDict = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSDictionary.self, NSString.self, NSData.self], from: anchorData) as? [String: Data] {
                     for (typeId, anchorData) in anchorsDict {
-                        saveAnchorData(anchorData, typeIdentifier: typeId, userKey: item.userKey)
+                        saveIfAbsent(anchorData, typeId)
                     }
-                    logMessage("Saved anchors for \(anchorsDict.count) types")
                 }
             } else {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)) {
-                    saveAnchorData(anchorData, typeIdentifier: item.typeIdentifier, userKey: item.userKey)
+                    saveIfAbsent(anchorData, item.typeIdentifier)
                 }
             }
-            
+            if saved > 0 || kept > 0 {
+                // Nur Zahlen, keine Typen (LO-12).
+                logDiagnostic("Outbox: saved anchors for \(saved) types, kept \(kept) existing")
+            }
+
             try? FileManager.default.removeItem(atPath: anchorPath)
         }
         
@@ -440,17 +491,22 @@ extension OpenWearablesHealthSDK {
                     continue
                 }
                 
-                let payloadURL = URL(fileURLWithPath: item.payloadPath)
-                guard FileManager.default.fileExists(atPath: payloadURL.path) else {
+                // Fork (Plan 09-03): Pfade aus einem früheren App-Container werden in der heutigen
+                // Outbox gesucht (`resolveOutboxPath`). Ab hier gelten nur die aufgelösten Pfade:
+                // Ablauf, Prüfung auf laufende Uploads und `taskDescription`, aus der der Delegate
+                // nach der Antwort aufräumt.
+                guard let payloadPath = self.resolveOutboxPath(item.payloadPath) else {
                     // Orphaned metadata without a payload - clean up
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
-                
+                let payloadURL = URL(fileURLWithPath: payloadPath)
+                let anchorPath = item.anchorPath.flatMap { self.resolveOutboxPath($0) }
+
                 if age > Self.outboxMaxItemAge {
                     self.logMessage("Outbox: dropping stale item (\(Int(age / 3600))h old)")
                     try? FileManager.default.removeItem(at: payloadURL)
-                    if let anchorPath = item.anchorPath {
+                    if let anchorPath = anchorPath {
                         try? FileManager.default.removeItem(atPath: anchorPath)
                     }
                     try? FileManager.default.removeItem(at: itemURL)
@@ -468,7 +524,7 @@ extension OpenWearablesHealthSDK {
                 )
                 
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
-                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? "", "\(self.currentSessionEpoch())"].joined(separator: "|")
+                task.taskDescription = [itemURL.path, payloadURL.path, anchorPath ?? "", "\(self.currentSessionEpoch())"].joined(separator: "|")
                 task.resume()
                 enqueued += 1
             }
