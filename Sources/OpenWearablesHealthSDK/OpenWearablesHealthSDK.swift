@@ -44,7 +44,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Fork-Stand statt Upstream-Stand: Backend und Logs sollen sehen, dass hier der
     // Fork (Upstream 0.15.0 + Mirror-Dedupe + GPS-Strecken + Adoption) läuft, und
     // keinen reinen Upstream-Stand vorgetäuscht bekommen.
-    internal static let sdkVersion = "0.15.0-ow.3"
+    internal static let sdkVersion = "0.15.0-ow.4"
 
     // MARK: - Public Callbacks
     
