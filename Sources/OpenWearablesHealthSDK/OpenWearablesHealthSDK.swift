@@ -728,6 +728,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Schaltet nichts ein: dafür ist `secondarySinkEnabled` da, Standard aus. Ein Host ohne
     /// http(s) oder ein leerer Schlüssel ändern nichts, das steht dann im Log. Gesendet wird an
     /// `<host>/api/v1/sdk/users/<userId des Primärziels>/sync` mit `X-Open-Wearables-API-Key`.
+    ///
+    /// Ändern sich Host oder Schlüssel, endet eine laufende Wartezeit nach 401/403 (ow.5). Derselbe
+    /// Aufruf mit denselben Werten, etwa bei jedem App-Start, lässt sie stehen.
     public func configureSecondarySink(host: String, apiKey: String) {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -735,7 +738,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             logDiagnostic("Secondary: configuration ignored (host must be http(s), key must not be empty)")
             return
         }
+        let changed = OpenWearablesHealthSdkKeychain.getSecondaryHost() != trimmedHost
+            || OpenWearablesHealthSdkKeychain.getSecondaryApiKey() != trimmedKey
         OpenWearablesHealthSdkKeychain.saveSecondary(host: trimmedHost, apiKey: trimmedKey)
+        if changed {
+            makeSecondaryOutbox().clearAuthPause()
+        }
         logMessage("Secondary: target configured")
     }
 
@@ -766,10 +774,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     /// Die Statusschlüssel des Zweitziels. Lesen legt nichts an. `secondaryLastError` ist nur ein
     /// Kurztext wie `HTTP 503`, `auth 401` oder `network(-1009)`, nie ein Antworttext.
+    ///
+    /// Seit ow.5: `secondaryPausedUntil` (ISO 8601, nur solange die Wartezeit nach 401/403 läuft,
+    /// sonst `NSNull`), `secondaryAuthFailures` (401/403 in Folge) und `secondaryDeadDropped` (aus
+    /// `dead/` gelöschte Pakete).
     internal func secondarySyncStatus() -> [String: Any] {
         let outbox = makeSecondaryOutbox()
         let counts = outbox.counts()
         let state = outbox.state()
+        let now = Date()
+        let pausedUntil = state.pausedUntil.flatMap { $0 > now ? $0 : nil }
         return [
             "secondaryEnabled": lanesSecondaryEnabled,
             "secondaryConfigured": secondaryCredentials() != nil,
@@ -777,7 +791,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             "secondaryDead": counts.dead,
             "secondaryGap": state.gapCount,
             "secondaryLastSuccessAt": state.lastSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
-            "secondaryLastError": state.lastError ?? NSNull()
+            "secondaryLastError": state.lastError ?? NSNull(),
+            "secondaryPausedUntil": pausedUntil.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+            "secondaryAuthFailures": state.authFailures,
+            "secondaryDeadDropped": state.deadDropped
         ]
     }
     

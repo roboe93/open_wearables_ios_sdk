@@ -99,6 +99,9 @@ final class SecondaryWiringTests: XCTestCase {
             XCTAssertEqual(status["secondaryGap"] as? Int, 0)
             XCTAssertTrue(status["secondaryLastSuccessAt"] is NSNull)
             XCTAssertTrue(status["secondaryLastError"] is NSNull)
+            XCTAssertTrue(status["secondaryPausedUntil"] is NSNull)
+            XCTAssertEqual(status["secondaryAuthFailures"] as? Int, 0)
+            XCTAssertEqual(status["secondaryDeadDropped"] as? Int, 0)
             XCTAssertFalse(FileManager.default.fileExists(atPath: sdk.secondaryDirectory().path))
         }
     }
@@ -203,6 +206,93 @@ final class SecondaryWiringTests: XCTestCase {
             XCTAssertTrue(sdk.isSessionValid)
             XCTAssertEqual(authErrors, 0)
             XCTAssertEqual(StubURLProtocol.recorded.count, secondaryRequests().count, "kein Aufruf ans Primärziel")
+        }
+    }
+
+    // MARK: - Wartezeit und Deckel (ow.5)
+
+    /// Nach 401 nennen Status und Journal die Wartezeit, ein zweiter Anstoß sendet nichts.
+    func testAfterA401StatusAndJournalShowTheWaitAndASecondTriggerSendsNothing() throws {
+        try withWiring { sdk in
+            try leaveFiles(sdk, [#"{"n":1}"#])
+            sdk.configureSecondarySink(host: secondaryHost, apiKey: secondaryKey)
+            sdk.secondarySinkEnabled = true
+            StubURLProtocol.install { _ in .status(401) }
+            let before = Date()
+
+            _ = drain(sdk, trigger: "cycle")
+
+            let status = status(sdk)
+            let until = try XCTUnwrap(status["secondaryPausedUntil"] as? String, "\(status)")
+            let date = try XCTUnwrap(ISO8601DateFormatter().date(from: until))
+            XCTAssertGreaterThan(date, before.addingTimeInterval(55))
+            XCTAssertLessThan(date, Date().addingTimeInterval(61))
+            XCTAssertEqual(status["secondaryAuthFailures"] as? Int, 1)
+            let entry = try XCTUnwrap(secondaryEntries(sdk).last)
+            XCTAssertEqual(entry.status, "auth 401")
+            let note = try XCTUnwrap(entry.note)
+            XCTAssertTrue(note.contains("authFailures=1"), note)
+            XCTAssertTrue(note.contains("waitUntil="), note)
+            XCTAssertTrue(note.contains("deadDropped=0"), note)
+
+            let held = drain(sdk)
+
+            XCTAssertNotNil(held??.pausedUntil)
+            XCTAssertEqual(secondaryRequests().count, 1, "während der Wartezeit geht nichts hinaus")
+            XCTAssertEqual(self.status(sdk)["secondaryQueued"] as? Int, 1)
+        }
+    }
+
+    /// Nur geänderte Zugangsdaten beenden die Wartezeit. Derselbe Aufruf mit denselben Werten, wie
+    /// ihn die App bei jedem Start macht, lässt sie stehen.
+    func testOnlyAChangedConfigurationEndsTheAuthWait() throws {
+        try withWiring { sdk in
+            try leaveFiles(sdk, [#"{"n":1}"#])
+            sdk.configureSecondarySink(host: secondaryHost, apiKey: secondaryKey)
+            sdk.secondarySinkEnabled = true
+            StubURLProtocol.install { _ in .status(401) }
+            _ = drain(sdk)
+            XCTAssertFalse(status(sdk)["secondaryPausedUntil"] is NSNull)
+
+            sdk.configureSecondarySink(host: secondaryHost, apiKey: secondaryKey)
+            _ = drain(sdk)
+            XCTAssertEqual(secondaryRequests().count, 1, "dieselben Werte: die Wartezeit bleibt")
+            XCTAssertEqual(status(sdk)["secondaryAuthFailures"] as? Int, 1)
+
+            sdk.configureSecondarySink(host: secondaryHost, apiKey: "neuer-schluessel")
+            XCTAssertTrue(status(sdk)["secondaryPausedUntil"] is NSNull)
+            XCTAssertEqual(status(sdk)["secondaryAuthFailures"] as? Int, 0)
+
+            StubURLProtocol.install { _ in .status(202) }
+            _ = drain(sdk)
+            let sent = secondaryRequests()
+            XCTAssertEqual(sent.count, 1)
+            XCTAssertEqual(sent.first?.request.value(forHTTPHeaderField: "X-Open-Wearables-API-Key"), "neuer-schluessel")
+            XCTAssertEqual(status(sdk)["secondaryQueued"] as? Int, 0)
+        }
+    }
+
+    /// Ein Paket, das länger als 30 Tage in `dead/` liegt, wird beim nächsten Anstoß gelöscht. Status
+    /// und Journal weisen das aus.
+    func testDeadFilesPastTheCapAreDroppedAndShownInStatusAndJournal() throws {
+        try withWiring { sdk in
+            let past = ManualClock(Date().addingTimeInterval(-31 * 24 * 3600))
+            let earlier = SecondaryOutbox(baseDirectory: sdk.secondaryDirectory(), clock: past)
+            XCTAssertTrue(earlier.markDead(try earlier.enqueue(Data(#"{"n":1}"#.utf8))))
+            XCTAssertEqual(status(sdk)["secondaryDead"] as? Int, 1)
+            sdk.configureSecondarySink(host: secondaryHost, apiKey: secondaryKey)
+            sdk.secondarySinkEnabled = true
+            StubURLProtocol.install { _ in .status(202) }
+
+            let result = drain(sdk)
+
+            XCTAssertEqual(result??.dropped, 1)
+            let status = status(sdk)
+            XCTAssertEqual(status["secondaryDead"] as? Int, 0)
+            XCTAssertEqual(status["secondaryDeadDropped"] as? Int, 1)
+            let note = try XCTUnwrap(secondaryEntries(sdk).last?.note)
+            XCTAssertTrue(note.contains("deadDropped=1"), note)
+            XCTAssertTrue(secondaryRequests().isEmpty)
         }
     }
 

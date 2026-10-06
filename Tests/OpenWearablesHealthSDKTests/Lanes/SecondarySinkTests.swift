@@ -33,9 +33,14 @@ final class SecondarySinkTests: XCTestCase {
         clock: LaneClock,
         maxBytes: Int = SecondaryOutbox.defaultMaxBytes,
         maxAge: TimeInterval = SecondaryOutbox.defaultMaxAge,
+        maxDeadBytes: Int = SecondaryOutbox.defaultMaxDeadBytes,
+        maxDeadAge: TimeInterval = SecondaryOutbox.defaultMaxDeadAge,
         log: @escaping (String) -> Void = { _ in }
     ) -> SecondaryOutbox {
-        SecondaryOutbox(baseDirectory: base, clock: clock, log: log, maxBytes: maxBytes, maxAge: maxAge)
+        SecondaryOutbox(
+            baseDirectory: base, clock: clock, log: log, maxBytes: maxBytes, maxAge: maxAge,
+            maxDeadBytes: maxDeadBytes, maxDeadAge: maxDeadAge
+        )
     }
 
     private func stubSession() -> URLSession {
@@ -161,6 +166,84 @@ final class SecondarySinkTests: XCTestCase {
         XCTAssertEqual(restarted.lastGapAt, clock.now())
     }
 
+    // MARK: - Deckel für dead/ (ow.5)
+
+    /// Die Grenzen aus dem Auftrag: 50 MB und 30 Tage, als Standard jeder Outbox.
+    func testDeadCapsAreFiftyMegabytesAndThirtyDays() {
+        XCTAssertEqual(SecondaryOutbox.defaultMaxDeadBytes, 50 * 1024 * 1024)
+        XCTAssertEqual(SecondaryOutbox.defaultMaxDeadAge, 30 * 24 * 3600)
+        let outbox = SecondaryOutbox(baseDirectory: base, clock: ManualClock(start))
+        XCTAssertEqual(outbox.maxDeadBytes, 50 * 1024 * 1024)
+        XCTAssertEqual(outbox.maxDeadAge, 30 * 24 * 3600)
+    }
+
+    /// Über dem Größendeckel von `dead/` werden dort die ältesten gelöscht, bis es wieder passt.
+    /// Gezählt in `deadDropped`, die Zahl übersteht einen Neustart. `outbox/` bleibt unberührt.
+    func testDeadOverTheSizeCapDeletesTheOldestAndCountsThem() throws {
+        let clock = ManualClock(start)
+        let outbox = makeOutbox(clock: clock, maxDeadBytes: 10)
+        let files = try ["aaaa", "bbbb", "cccc", "dddd"].map { try outbox.enqueue(body($0)) }
+
+        XCTAssertTrue(outbox.markDead(files[0]))
+        clock.advance(1)
+        XCTAssertTrue(outbox.markDead(files[1]))
+        XCTAssertEqual(outbox.state().deadDropped, 0, "8 Byte passen unter den Deckel")
+        clock.advance(1)
+        XCTAssertTrue(outbox.markDead(files[2]))
+
+        XCTAssertEqual(contents(outbox.deadFiles()), ["bbbb", "cccc"])
+        XCTAssertEqual(outbox.state().deadDropped, 1)
+        XCTAssertEqual(contents(outbox.pending()), ["dddd"])
+        XCTAssertEqual(makeOutbox(clock: clock, maxDeadBytes: 10).state().deadDropped, 1)
+    }
+
+    /// Länger als 30 Tage in `dead/`: gelöscht und gezählt. Das Alter zählt ab dem Verschieben,
+    /// nicht ab dem Einreihen.
+    func testDeadFilesPastTheMaximumAgeAreDeletedCountingFromTheMove() throws {
+        let clock = ManualClock(start)
+        let outbox = makeOutbox(clock: clock)
+        let old = try outbox.enqueue(body("alt"))
+        let newer = try outbox.enqueue(body("neu"))
+        clock.advance(20 * 24 * 3600)
+        XCTAssertTrue(outbox.markDead(old))
+        clock.advance(20 * 24 * 3600)
+        XCTAssertTrue(outbox.markDead(newer))
+        clock.advance(10 * 24 * 3600)
+
+        XCTAssertEqual(outbox.enforceCaps(), 0, "50 Tage eingereiht, aber erst 30 Tage in dead/")
+        XCTAssertEqual(contents(outbox.deadFiles()), ["alt", "neu"])
+
+        clock.advance(1)
+        XCTAssertEqual(outbox.enforceCaps(), 1)
+        XCTAssertEqual(contents(outbox.deadFiles()), ["neu"])
+        XCTAssertEqual(outbox.state().deadDropped, 1)
+    }
+
+    /// Ein Durchlauf wendet den Deckel zu Beginn an und meldet die Zahl im Ergebnis.
+    func testDrainReportsDeadDrops() throws {
+        let clock = ManualClock(start)
+        let outbox = makeOutbox(clock: clock)
+        XCTAssertTrue(outbox.markDead(try outbox.enqueue(body("alt"))))
+        clock.advance(31 * 24 * 3600)
+        StubURLProtocol.install { _ in .status(202) }
+
+        let result = drain(makeUploader(outbox, clock: clock))
+
+        XCTAssertEqual(result?.dropped, 1)
+        XCTAssertTrue(outbox.deadFiles().isEmpty)
+        XCTAssertTrue(StubURLProtocol.requests.isEmpty)
+    }
+
+    /// Ein `state.json` aus ow.4 kennt die neuen Felder nicht und dekodiert mit Nullwerten.
+    func testStateWithoutTheOw5FieldsDecodes() throws {
+        let json = #"{"version":1,"files":{},"gapCount":2}"#
+        let state = try BackfillPlan.makeDecoder().decode(SecondaryState.self, from: Data(json.utf8))
+        XCTAssertEqual(state.gapCount, 2)
+        XCTAssertEqual(state.authFailures, 0)
+        XCTAssertNil(state.pausedUntil)
+        XCTAssertEqual(state.deadDropped, 0)
+    }
+
     // MARK: - Wiederholungspolitik
 
     func testPolicyDeliversOnSuccess() {
@@ -189,6 +272,14 @@ final class SecondarySinkTests: XCTestCase {
         XCTAssertEqual(policy.decide(status: 403, error: false, now: start), .pause(authStatus: 403))
         XCTAssertTrue(policy.state.rejections.isEmpty)
         XCTAssertEqual(policy.state.failures, 0)
+    }
+
+    /// Wartezeit nach 401/403 in Folge: 1 min, 5 min, 30 min, 2 h, danach 6 h (ow.5).
+    func testAuthWaitGrowsInStepsUpToSixHours() {
+        XCTAssertEqual(
+            (1...7).map { SecondaryPolicy.authWait(afterFailures: $0) },
+            [60, 300, 1800, 7200, 21600, 21600, 21600]
+        )
     }
 
     /// 400/413/422 dreimal im Abstand von je mindestens einer Stunde: beim dritten Mal `dead`.
@@ -297,6 +388,42 @@ final class SecondarySinkTests: XCTestCase {
             XCTAssertEqual(authErrors, 0)
             XCTAssertTrue(OpenWearablesHealthSdkKeychain.hasSession(), "das Primärziel bleibt angemeldet")
         }
+    }
+
+    /// Nach 401 wartet der Sender, auch über einen Neustart (neue Instanzen) hinweg. Jede weitere
+    /// Ablehnung in Folge wartet länger, ein 2xx setzt Zähler und Wartezeit zurück (ow.5).
+    func testAfterAnAuthErrorTheSenderWaitsLongerEachTimeAndResetsOnSuccess() throws {
+        let clock = ManualClock(start)
+        let outbox = makeOutbox(clock: clock)
+        try outbox.enqueue(body("1"))
+        StubURLProtocol.install { _ in .status(403) }
+
+        let first = drain(makeUploader(outbox, clock: clock))
+        XCTAssertEqual(first?.paused, true)
+        XCTAssertEqual(first?.pausedUntil, start.addingTimeInterval(60))
+        XCTAssertEqual(outbox.state().authFailures, 1)
+        XCTAssertEqual(StubURLProtocol.requests.count, 1)
+
+        clock.advance(59)
+        let held = drain(makeUploader(makeOutbox(clock: clock), clock: clock))
+        XCTAssertEqual(StubURLProtocol.requests.count, 1, "während der Wartezeit geht nichts hinaus")
+        XCTAssertEqual(held?.paused, false)
+        XCTAssertEqual(held?.pausedUntil, start.addingTimeInterval(60))
+
+        clock.advance(1)
+        let second = drain(makeUploader(outbox, clock: clock))
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+        XCTAssertEqual(second?.pausedUntil, clock.now().addingTimeInterval(300))
+        XCTAssertEqual(outbox.state().authFailures, 2)
+        XCTAssertEqual(contents(outbox.pending()), ["1"], "die Datei bleibt")
+
+        clock.advance(300)
+        StubURLProtocol.install { _ in .status(202) }
+        let third = drain(makeUploader(outbox, clock: clock))
+        XCTAssertEqual(third?.delivered, 1)
+        XCTAssertNil(third?.pausedUntil)
+        XCTAssertEqual(outbox.state().authFailures, 0)
+        XCTAssertNil(outbox.state().pausedUntil)
     }
 
     /// Ein dauerhaft abgewiesenes Paket hält die Reihe auf, bis es nach drei Ablehnungen im

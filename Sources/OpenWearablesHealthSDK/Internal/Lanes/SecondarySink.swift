@@ -8,13 +8,16 @@ import Foundation
 //
 //   - `SecondaryOutbox`: Dateien unter `health_secondary/outbox/`, Reihenfolge nach Dateiname,
 //     `dead/` für Aufgegebenes, Deckel nach Größe und Alter. Nie stilles Löschen: was nicht
-//     zugestellt wird, liegt in `dead/` und ist gezählt (`gapCount`).
+//     zugestellt wird, liegt in `dead/` und ist gezählt (`gapCount`). Seit ow.5 hat auch `dead/`
+//     einen Deckel (50 MB, 30 Tage ab dem Verschieben). Darüber werden die ältesten Dateien
+//     gelöscht und gezählt (`deadDropped`); das Primärziel hat diese Pakete ohnehin.
 //   - `SecondaryPolicy`: rein, entscheidet aus Status und Zeitpunkt.
 //   - `SecondaryUploader`: eigene `URLSession`, seriell, ein Durchlauf je Ordner zur selben Zeit.
 //
 // Anchors hängen nur am Primärziel. Das Zweitziel berührt nie Cursor, Anmeldung oder Primärpfad:
 // 401 und 403 pausieren nur das Zweitziel, ohne Abmeldung, ohne Auth-Rückruf an die App und ohne
-// Token-Refresh. Die Hintergrund-Session des SDK wird nie benutzt: ihr Delegate liest
+// Token-Refresh. Seit ow.5 mit wachsender Wartezeit (1 min, 5 min, 30 min, 2 h, dann 6 h), damit
+// ein falscher Schlüssel nicht bei jedem Anstoß ein volles Paket kostet. Die Hintergrund-Session des SDK wird nie benutzt: ihr Delegate liest
 // `taskDescription` als Eintrag der alten Outbox und würde Dateien nach deren Regeln löschen.
 //
 // Datenschutz (LO-12): Ins Log gehen nur Zahlen und Statuscodes, nie Ladung oder Antworttext.
@@ -75,8 +78,8 @@ extension OpenWearablesHealthSDK {
     /// zweite meldet `skipped` (`SecondaryUploader`).
     ///
     /// Angestoßen wird nach jedem lanes-Zyklus (`trigger` `cycle`, mit den Zahlen seines Senders), bei
-    /// der Rückkehr in den Vordergrund und wenn das Netz wieder da ist. 401/403 pausieren ohne eigene
-    /// Wartezeit (09-03): der nächste dieser Anstöße versucht es wieder.
+    /// der Rückkehr in den Vordergrund und wenn das Netz wieder da ist. Nach 401/403 sendet erst ein
+    /// Anstoß nach Ablauf der Wartezeit wieder (`SecondaryState.pausedUntil`, ow.5).
     internal func drainSecondaryIfActive(
         trigger: String, enqueued: Int = 0, enqueueFailed: Int = 0,
         completion: ((SecondaryDrainResult?) -> Void)? = nil
@@ -95,7 +98,7 @@ extension OpenWearablesHealthSDK {
             uploader.drain(target: target) { result in
                 self?.journalSecondary(
                     result, trigger: trigger, enqueued: enqueued, enqueueFailed: enqueueFailed,
-                    queued: outbox.counts().queued
+                    queued: outbox.counts().queued, state: outbox.state()
                 )
                 completion?(result)
             }
@@ -103,19 +106,33 @@ extension OpenWearablesHealthSDK {
     }
 
     /// Ein Journal-Eintrag je Durchlauf mit Wirkung (Art `secondary`): nur Zahlen und als Status der
-    /// Kurztext des letzten Fehlers (`HTTP 503`, `auth 401`) oder `ok`. Kein Host, kein Schlüssel, kein
-    /// Nutzer, keine Ladung (T-09-13). Ein Durchlauf ohne jede Wirkung schreibt nichts, sonst liefe der
-    /// Ring (200) mit leeren Einträgen voll.
+    /// Kurztext des letzten Fehlers (`HTTP 503`, `auth 401`), `waiting` während der Wartezeit nach
+    /// 401/403 oder `ok`. Kein Host, kein Schlüssel, kein Nutzer, keine Ladung (T-09-13). Ein
+    /// Durchlauf ohne jede Wirkung schreibt nichts, sonst liefe der Ring (200) mit leeren Einträgen
+    /// voll.
+    ///
+    /// Seit ow.5 trägt die Notiz `deadDropped` (Summe der aus `dead/` gelöschten Pakete) und während
+    /// einer Wartezeit `waitUntil=<ISO 8601>`.
     private func journalSecondary(
-        _ result: SecondaryDrainResult, trigger: String, enqueued: Int, enqueueFailed: Int, queued: Int
+        _ result: SecondaryDrainResult, trigger: String, enqueued: Int, enqueueFailed: Int, queued: Int,
+        state: SecondaryState
     ) {
-        let acted = result.delivered + result.retried + result.dead > 0 || result.paused || result.lastError != nil
+        let acted = result.delivered + result.retried + result.dead + result.dropped > 0
+            || result.paused || result.lastError != nil
         guard acted || enqueued > 0 || enqueueFailed > 0 else { return }
         let status: String
         if result.skipped {
             status = "skipped"
+        } else if let error = result.lastError {
+            status = error
         } else {
-            status = result.lastError ?? "ok"
+            status = result.pausedUntil == nil ? "ok" : "waiting"
+        }
+        var note = "delivered=\(result.delivered) retried=\(result.retried) dead=\(result.dead) "
+            + "paused=\(result.paused ? 1 : 0) queued=\(queued) enqueued=\(enqueued) failed=\(enqueueFailed) "
+            + "deadDropped=\(state.deadDropped)"
+        if let until = result.pausedUntil {
+            note += " authFailures=\(state.authFailures) waitUntil=\(ISO8601DateFormatter().string(from: until))"
         }
         runJournal.record(SyncJournalEntry(
             at: Date(),
@@ -123,8 +140,7 @@ extension OpenWearablesHealthSDK {
             trigger: trigger,
             status: status,
             records: result.delivered,
-            note: "delivered=\(result.delivered) retried=\(result.retried) dead=\(result.dead) "
-                + "paused=\(result.paused ? 1 : 0) queued=\(queued) enqueued=\(enqueued) failed=\(enqueueFailed)"
+            note: note
         ))
     }
 
@@ -179,9 +195,18 @@ struct SecondaryState: Codable, Equatable {
     var lastSuccessAt: Date?
     /// Kurz und ohne Inhalt: `HTTP 503`, `auth 401`, `network(-1009)`.
     var lastError: String?
+    /// 401/403 in Folge (ow.5), Grundlage der Wartezeit. Null nach einem 2xx und nach einer
+    /// geänderten Konfiguration (`configureSecondarySink` mit anderem Host oder Schlüssel).
+    var authFailures: Int = 0
+    /// Nach 401/403 sendet der Sender bis dahin nichts an das Zweitziel (ow.5).
+    var pausedUntil: Date?
+    /// Aus `dead/` gelöschte Pakete (Deckel 50 MB, 30 Tage, ow.5). Summe, bis `signOut` den Ordner
+    /// entfernt.
+    var deadDropped: Int = 0
 
     init() {}
 
+    // Die Felder aus ow.5 sind additiv: eine Datei aus ow.4 dekodiert, die Dateiversion bleibt 1.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? SecondaryState.currentVersion
@@ -190,6 +215,9 @@ struct SecondaryState: Codable, Equatable {
         lastGapAt = try container.decodeIfPresent(Date.self, forKey: .lastGapAt)
         lastSuccessAt = try container.decodeIfPresent(Date.self, forKey: .lastSuccessAt)
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        authFailures = try container.decodeIfPresent(Int.self, forKey: .authFailures) ?? 0
+        pausedUntil = try container.decodeIfPresent(Date.self, forKey: .pausedUntil)
+        deadDropped = try container.decodeIfPresent(Int.self, forKey: .deadDropped) ?? 0
     }
 }
 
@@ -200,7 +228,7 @@ enum SecondaryDecision: Equatable {
     case delivered
     /// Später erneut; der Durchlauf endet hier, die Reihenfolge bleibt.
     case retry(after: TimeInterval)
-    /// 401/403: das Zweitziel ruht bis zum nächsten Durchlauf. Die Datei bleibt.
+    /// 401/403: das Zweitziel ruht für die Wartezeit (`SecondaryPolicy.authWait`). Die Datei bleibt.
     case pause(authStatus: Int)
     /// Dritte gezählte Ablehnung: nach `dead/`, der Durchlauf geht mit der nächsten Datei weiter.
     case dead
@@ -212,10 +240,13 @@ enum SecondaryDecision: Equatable {
 /// sind ein Urteil über das Paket. Drei davon im Abstand von je mindestens einer Stunde schicken es
 /// nach `dead/`; eine Ablehnung innerhalb des Abstands zählt nicht und wartet bis zu seinem Ende.
 /// Alles andere (5xx, 429, Netz, übrige 4xx) wird mit Backoff wiederholt: 1 Minute, verdoppelnd,
-/// höchstens 1 Stunde.
+/// höchstens 1 Stunde. 401 und 403 betreffen das ganze Ziel, nicht das Paket: dafür gilt die
+/// Staffel `authWaitSteps` (ow.5), im Zustand der Outbox und nicht je Datei.
 struct SecondaryPolicy {
     static let initialBackoff: TimeInterval = 60
     static let maxBackoff: TimeInterval = 3600
+    /// Wartezeit nach der 1., 2., 3., 4. und jeder weiteren Ablehnung mit 401/403 in Folge.
+    static let authWaitSteps: [TimeInterval] = [60, 300, 1800, 7200, 21600]
     static let deadAfter = RejectionPolicy.parkAfter
     static let countSpacing = RejectionPolicy.countSpacing
 
@@ -266,6 +297,11 @@ struct SecondaryPolicy {
         let exponent = min(max(failures - 1, 0), 16)
         return min(initialBackoff * pow(2, Double(exponent)), maxBackoff)
     }
+
+    /// 1 min, 5 min, 30 min, 2 h, danach immer 6 h.
+    static func authWait(afterFailures failures: Int) -> TimeInterval {
+        authWaitSteps[min(max(failures - 1, 0), authWaitSteps.count - 1)]
+    }
 }
 
 // MARK: - Outbox
@@ -285,10 +321,15 @@ final class SecondaryOutbox {
 
     static let defaultMaxBytes = 200 * 1024 * 1024
     static let defaultMaxAge: TimeInterval = 30 * 24 * 3600
+    /// Deckel für `dead/` (ow.5). Gemessen wird ab dem Verschieben, nicht ab dem Einreihen.
+    static let defaultMaxDeadBytes = 50 * 1024 * 1024
+    static let defaultMaxDeadAge: TimeInterval = 30 * 24 * 3600
 
     let baseDirectory: URL
     let maxBytes: Int
     let maxAge: TimeInterval
+    let maxDeadBytes: Int
+    let maxDeadAge: TimeInterval
 
     var outboxDirectory: URL { baseDirectory.appendingPathComponent("outbox", isDirectory: true) }
     var deadDirectory: URL { baseDirectory.appendingPathComponent("dead", isDirectory: true) }
@@ -305,13 +346,17 @@ final class SecondaryOutbox {
         clock: LaneClock = SystemLaneClock(),
         log: @escaping (String) -> Void = { _ in },
         maxBytes: Int = SecondaryOutbox.defaultMaxBytes,
-        maxAge: TimeInterval = SecondaryOutbox.defaultMaxAge
+        maxAge: TimeInterval = SecondaryOutbox.defaultMaxAge,
+        maxDeadBytes: Int = SecondaryOutbox.defaultMaxDeadBytes,
+        maxDeadAge: TimeInterval = SecondaryOutbox.defaultMaxDeadAge
     ) {
         self.baseDirectory = baseDirectory
         self.clock = clock
         self.log = log
         self.maxBytes = max(1, maxBytes)
         self.maxAge = maxAge
+        self.maxDeadBytes = max(1, maxDeadBytes)
+        self.maxDeadAge = maxDeadAge
         self.lock = LaneFileLocks.lock(for: baseDirectory.appendingPathComponent("state.json"))
     }
 
@@ -360,8 +405,9 @@ final class SecondaryOutbox {
 
     // MARK: Verschieben und Entfernen
 
-    /// Verschiebt ein Paket nach `dead/`. Nie gelöscht. `false`, wenn das Verschieben scheitert:
-    /// dann bleibt die Datei in `outbox/`.
+    /// Verschiebt ein Paket nach `dead/`. Das Verschieben löscht nie. `false`, wenn es scheitert:
+    /// dann bleibt die Datei in `outbox/`. Danach gilt der Deckel für `dead/`
+    /// (`enforceDeadCapLocked`), der die ältesten Dateien dort löschen kann.
     @discardableResult
     func markDead(_ url: URL) -> Bool {
         lock.lock()
@@ -369,6 +415,7 @@ final class SecondaryOutbox {
         let moved = moveToDeadLocked(url)
         if moved {
             try? updateStateLocked { $0.files[url.lastPathComponent] = nil }
+            enforceDeadCapLocked(now: clock.now())
         }
         return moved
     }
@@ -384,14 +431,17 @@ final class SecondaryOutbox {
     // MARK: Deckel
 
     /// Älter als `maxAge` oder über `maxBytes`: die ältesten wandern nach `dead/`, `gapCount` steigt,
-    /// `lastGapAt` wird gesetzt. Nichts wird gelöscht.
-    func enforceCaps() {
+    /// `lastGapAt` wird gesetzt. Das Verschieben löscht nichts. Danach der Deckel für `dead/`; das
+    /// Ergebnis ist die Zahl der dort gelöschten Pakete.
+    @discardableResult
+    func enforceCaps() -> Int {
         lock.lock()
         defer { lock.unlock() }
-        enforceCapsLocked(now: clock.now())
+        return enforceCapsLocked(now: clock.now())
     }
 
-    private func enforceCapsLocked(now: Date) {
+    @discardableResult
+    private func enforceCapsLocked(now: Date) -> Int {
         var moved = 0
 
         for url in pendingLocked() where now.timeIntervalSince(Self.enqueuedAt(url)) > maxAge {
@@ -408,16 +458,51 @@ final class SecondaryOutbox {
             }
         }
 
-        guard moved > 0 else { return }
-        do {
-            try updateStateLocked { state in
-                state.gapCount += moved
-                state.lastGapAt = now
+        if moved > 0 {
+            do {
+                try updateStateLocked { state in
+                    state.gapCount += moved
+                    state.lastGapAt = now
+                }
+                log("Secondary: outbox over cap, moved \(moved) package(s) to dead/")
+            } catch {
+                log("Secondary: outbox over cap, moved \(moved) package(s) to dead/, gap count not recorded")
             }
-            log("Secondary: outbox over cap, moved \(moved) package(s) to dead/")
-        } catch {
-            log("Secondary: outbox over cap, moved \(moved) package(s) to dead/, gap count not recorded")
         }
+        return enforceDeadCapLocked(now: now)
+    }
+
+    /// Deckel für `dead/` (ow.5): Dateien, die länger als `maxDeadAge` dort liegen, und darüber
+    /// hinaus die ältesten, solange `dead/` größer als `maxDeadBytes` ist, werden gelöscht. Das Alter
+    /// zählt ab dem Verschieben (Änderungsdatum, beim Verschieben gesetzt). Gezählt in
+    /// `deadDropped`. Die Pakete liegen beim Primärziel, das sie vorher angenommen hat.
+    @discardableResult
+    private func enforceDeadCapLocked(now: Date) -> Int {
+        let files = Self.packages(in: deadDirectory)
+            .map { (url: $0, at: Self.deadAt($0), size: Self.size(of: $0)) }
+            .sorted { ($0.at, $0.url.lastPathComponent) < ($1.at, $1.url.lastPathComponent) }
+        guard !files.isEmpty else { return 0 }
+
+        var total = files.reduce(0) { $0 + $1.size }
+        var dropped = 0
+        for file in files where now.timeIntervalSince(file.at) > maxDeadAge || total > maxDeadBytes {
+            do {
+                try FileManager.default.removeItem(at: file.url)
+                total -= file.size
+                dropped += 1
+            } catch {
+                log("Secondary: could not delete a package from dead/")
+            }
+        }
+
+        guard dropped > 0 else { return 0 }
+        do {
+            try updateStateLocked { $0.deadDropped += dropped }
+            log("Secondary: dead/ over cap, deleted \(dropped) package(s)")
+        } catch {
+            log("Secondary: dead/ over cap, deleted \(dropped) package(s), count not recorded")
+        }
+        return dropped
     }
 
     /// Ein Paket ließ sich nicht einreihen (Platte voll, Rechte, Ordner fehlt). Es erreicht das
@@ -435,6 +520,25 @@ final class SecondaryOutbox {
             }
         } catch {
             log("Secondary: enqueue failed, gap count not recorded")
+        }
+    }
+
+    // MARK: Wartezeit nach 401/403
+
+    /// Hebt die Wartezeit nach 401/403 auf (ow.5, geänderte Konfiguration). Gibt es keine, wird nichts
+    /// geschrieben und kein Ordner angelegt.
+    func clearAuthPause() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .state(let current) = loadLocked(),
+              current.authFailures != 0 || current.pausedUntil != nil else { return }
+        do {
+            try updateStateLocked { state in
+                state.authFailures = 0
+                state.pausedUntil = nil
+            }
+        } catch {
+            log("Secondary: auth wait could not be cleared")
         }
     }
 
@@ -527,6 +631,9 @@ final class SecondaryOutbox {
                 destination = deadDirectory.appendingPathComponent("\(stem)-\(counter).json")
             }
             try FileManager.default.moveItem(at: url, to: destination)
+            // Das Alter in `dead/` zählt ab hier (`deadAt`). Scheitert das, gilt das alte
+            // Änderungsdatum, und die Datei fällt höchstens früher unter den Deckel.
+            try? FileManager.default.setAttributes([.modificationDate: clock.now()], ofItemAtPath: destination.path)
             return true
         } catch {
             log("Secondary: could not move a package to dead/")
@@ -564,6 +671,13 @@ final class SecondaryOutbox {
         return attributes?[.modificationDate] as? Date ?? Date()
     }
 
+    /// Zeitpunkt des Verschiebens nach `dead/`: das dabei gesetzte Änderungsdatum, ersatzweise der
+    /// Zeitpunkt des Einreihens.
+    private static func deadAt(_ url: URL) -> Date {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attributes?[.modificationDate] as? Date ?? enqueuedAt(url)
+    }
+
     private static func size(of url: URL) -> Int {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.size] as? NSNumber)?.intValue ?? 0
@@ -584,13 +698,18 @@ struct SecondaryDrainResult: Equatable {
     var deferredUntil: Date?
     /// Kurz und ohne Inhalt: `HTTP 503`, `auth 401`, `network(-1009)`, `unreadable`.
     var lastError: String?
+    /// Wartezeit nach 401/403 (ow.5): gesetzt, wenn dieser Durchlauf sie begonnen hat (`paused`) oder
+    /// wegen ihr nichts gesendet hat.
+    var pausedUntil: Date?
+    /// Zu Beginn des Durchlaufs aus `dead/` gelöschte Pakete (Deckel, ow.5).
+    var dropped = 0
 }
 
 /// Sendet die wartenden Pakete seriell in Reihenfolge an das Zweitziel.
 ///
 /// Eigene `URLSession` mit Standardkonfiguration (für Tests injizierbar). Der Durchlauf endet an
 /// der ersten Wiederholung, an einer Pause und an einem Paket, dessen Backoff noch läuft. Ein
-/// Paket in `dead/` hält die Reihe nicht auf.
+/// Paket in `dead/` hält die Reihe nicht auf. Während der Wartezeit nach 401/403 sendet er nichts.
 final class SecondaryUploader {
 
     private static let runningLock = NSLock()
@@ -638,23 +757,34 @@ final class SecondaryUploader {
         Self.running.insert(key)
         Self.runningLock.unlock()
 
-        outbox.enforceCaps()
+        var initial = SecondaryDrainResult()
+        initial.dropped = outbox.enforceCaps()
         outbox.pruneState()
         let files = outbox.pending()
 
-        sendNext(files[...], target: target, result: SecondaryDrainResult()) { [log] result in
+        let finish: (SecondaryDrainResult) -> Void = { [log] result in
             Self.runningLock.lock()
             Self.running.remove(key)
             Self.runningLock.unlock()
             if result.delivered + result.retried + result.dead > 0 || result.paused || result.lastError != nil {
+                let wait = result.pausedUntil.map { " waitUntil=\(ISO8601DateFormatter().string(from: $0))" } ?? ""
                 log(
                     "Secondary: delivered=\(result.delivered) retried=\(result.retried) dead=\(result.dead) "
                         + "paused=\(result.paused ? 1 : 0) queued=\(files.count - result.delivered - result.dead) "
-                        + "last=\(result.lastError ?? "-")"
+                        + "last=\(result.lastError ?? "-")" + wait
                 )
             }
             completion(result)
         }
+
+        // Wartezeit nach 401/403: kein Versuch, bis sie abgelaufen ist (ow.5).
+        if let until = outbox.state().pausedUntil, until > clock.now() {
+            initial.pausedUntil = until
+            finish(initial)
+            return
+        }
+
+        sendNext(files[...], target: target, result: initial, done: finish)
     }
 
     private func sendNext(
@@ -702,7 +832,9 @@ final class SecondaryUploader {
         session.dataTask(with: request) { _, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode
             let failure = Self.describe(status: status, error: error)
-            let decision = self.record(name: name, status: status, transportFailed: error != nil, failure: failure)
+            let (decision, pausedUntil) = self.record(
+                name: name, status: status, transportFailed: error != nil, failure: failure
+            )
 
             switch decision {
             case .delivered:
@@ -716,6 +848,7 @@ final class SecondaryUploader {
             case .pause(let authStatus):
                 result.paused = true
                 result.lastError = "auth \(authStatus)"
+                result.pausedUntil = pausedUntil
                 done(result)
             case .dead:
                 if self.outbox.markDead(file) {
@@ -732,9 +865,14 @@ final class SecondaryUploader {
     }
 
     /// Wendet die Politik auf den gespeicherten Zustand der Datei an und speichert das Ergebnis.
-    private func record(name: String, status: Int?, transportFailed: Bool, failure: String) -> SecondaryDecision {
+    /// Bei 401/403 kommt die neue Wartezeit mit zurück; ohne schreibbaren Zustand gibt es keine,
+    /// dann versucht es der nächste Anstoß wieder (wie vor ow.5).
+    private func record(
+        name: String, status: Int?, transportFailed: Bool, failure: String
+    ) -> (SecondaryDecision, Date?) {
         let now = clock.now()
         var decision = SecondaryDecision.retry(after: SecondaryPolicy.initialBackoff)
+        var pausedUntil: Date?
         do {
             try outbox.updateState { state in
                 var policy = SecondaryPolicy(state: state.files[name] ?? SecondaryFileState())
@@ -744,12 +882,21 @@ final class SecondaryUploader {
                     state.files[name] = nil
                     state.lastSuccessAt = now
                     state.lastError = nil
+                    state.authFailures = 0
+                    state.pausedUntil = nil
                 case .dead:
                     state.files[name] = nil
                     state.lastError = failure
-                case .retry, .pause:
+                case .retry:
                     state.files[name] = policy.state
                     state.lastError = failure
+                case .pause:
+                    state.files[name] = policy.state
+                    state.lastError = failure
+                    state.authFailures += 1
+                    let until = now.addingTimeInterval(SecondaryPolicy.authWait(afterFailures: state.authFailures))
+                    state.pausedUntil = until
+                    pausedUntil = until
                 }
             }
         } catch {
@@ -760,7 +907,7 @@ final class SecondaryUploader {
             if decision == .dead { decision = .retry(after: SecondaryPolicy.countSpacing) }
             log("Secondary: state.json not writable")
         }
-        return decision
+        return (decision, pausedUntil)
     }
 
     /// Nur Code und Status, nie die Beschreibung (kann eine URL enthalten) oder den Antworttext.
