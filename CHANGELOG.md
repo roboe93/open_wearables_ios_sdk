@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.15.0-ow.5 (Fork roboe93)
+
+Zwei Vorbedingungen, bevor das Zweitziel eingeschaltet wird (offene Punkte aus 09-03 und 09-04 der App). Beide mit Tests, die eine Mutationsprobe bestehen.
+
+* **Wartezeit nach 401/403 beim Zweitziel.** Bisher versuchte der Sender das erste Paket bei jedem Anstoß sofort erneut. Bei falschem Schlüssel kostete das bis zu etwa 1,3 MB je Anstoß (Zyklusende, Vordergrund, Netz). Jetzt wartet er nach jeder Ablehnung in Folge länger: 1 min, 5 min, 30 min, 2 h, danach 6 h. Zähler und Zeitpunkt liegen in `health_secondary/state.json` (`authFailures`, `pausedUntil`) und gelten über Neustarts. Ein 2xx setzt beides zurück. `configureSecondarySink` setzt es zurück, wenn sich Host oder Schlüssel ändern. Derselbe Aufruf mit denselben Werten, wie ihn die App bei jedem Start macht, lässt die Wartezeit stehen. 5xx, 429 und Netzfehler behalten ihren Backoff je Datei (1 Minute bis 1 Stunde).
+* **Deckel für `dead/`.** Das Verschieben nach `dead/` löscht weiterhin nie. Neu: Liegt eine Datei länger als 30 Tage in `dead/` (gezählt ab dem Verschieben) oder ist `dead/` größer als 50 MB, werden dort die ältesten Dateien gelöscht. Angewandt wird der Deckel beim Einreihen, beim Verschieben und zu Beginn jedes Durchlaufs. Gezählt wird in `deadDropped`. Die Pakete hat das Primärziel vorher angenommen. Die Grenzen stehen als `SecondaryOutbox.defaultMaxDeadBytes` und `defaultMaxDeadAge`.
+* **Status und Journal.** `getSyncStatus()` trägt zusätzlich `secondaryPausedUntil` (ISO 8601, nur solange die Wartezeit läuft, sonst `NSNull`), `secondaryAuthFailures` und `secondaryDeadDropped`. Die Journal-Notiz der Art `secondary` nennt `deadDropped`, während einer Wartezeit auch `authFailures` und `waitUntil`. Ein Durchlauf, der wegen der Wartezeit nichts sendet, hat den Status `waiting`. `state.json` bleibt Version 1, die neuen Felder sind additiv, eine Datei aus ow.4 dekodiert.
+* **Versionskennung** `0.15.0-ow.5`.
+* **Tests.** Fork-Suite 508 → 518.
+
 ## 0.15.0-ow.4 (Fork roboe93)
 
 Zwei Änderungen aus Phase 9 der App: die Korrektur eines Gerätebefunds und ein zweites Ziel für dieselben Pakete, beide mit Tests, die vor der Änderung rot waren.
