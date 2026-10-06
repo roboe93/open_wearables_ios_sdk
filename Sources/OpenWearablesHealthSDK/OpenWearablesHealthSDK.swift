@@ -313,6 +313,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// so a test run cannot read or delete the state of the app hosting it.
     internal var stateDirectoryOverride: URL?
 
+    /// Fork (Plan 09-04): Session des Zweitziel-Senders. Produktion lässt das nil, dann gilt
+    /// `SecondaryUploader.sharedSession`; Tests setzen eine `StubURLProtocol`-Session.
+    internal var secondarySessionOverride: URLSession?
+
     /// Root for `outboxDir()` and `syncStateDir()`.
     internal func stateBaseDirectory() -> URL {
         if let stateDirectoryOverride = stateDirectoryOverride {
@@ -574,6 +578,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
+        // Fork (Plan 09-04): Die Pakete des Zweitziels gehören dem abgemeldeten Nutzer, wie die
+        // Primär-Outbox. Seine Zugangsdaten entfernt `clearAll`.
+        clearSecondaryOutbox()
         mirrorDedupe.reset()
         OpenWearablesHealthSdkKeychain.clearAll()
         
@@ -705,8 +712,73 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     /// Get the current sync status.
+    ///
+    /// Fork (Plan 09-04, D-08): zusätzlich die Schlüssel des Zweitziels, siehe `secondarySyncStatus()`.
     public func getSyncStatus() -> [String: Any] {
-        return getSyncStatusDict()
+        var status = getSyncStatusDict()
+        status.merge(secondarySyncStatus()) { _, secondary in secondary }
+        return status
+    }
+
+    // MARK: - Zweitziel (Fork, Plan 09-04, D-08)
+
+    /// Speichert Host und API-Schlüssel des Zweitziels (D-08) im Keychain, mit
+    /// `AfterFirstUnlockThisDeviceOnly`, damit ein Kaltstart im Hintergrund liefern kann.
+    ///
+    /// Schaltet nichts ein: dafür ist `secondarySinkEnabled` da, Standard aus. Ein Host ohne
+    /// http(s) oder ein leerer Schlüssel ändern nichts, das steht dann im Log. Gesendet wird an
+    /// `<host>/api/v1/sdk/users/<userId des Primärziels>/sync` mit `X-Open-Wearables-API-Key`.
+    public func configureSecondarySink(host: String, apiKey: String) {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.absoluteHTTPURL(from: trimmedHost) != nil, !trimmedKey.isEmpty else {
+            logDiagnostic("Secondary: configuration ignored (host must be http(s), key must not be empty)")
+            return
+        }
+        OpenWearablesHealthSdkKeychain.saveSecondary(host: trimmedHost, apiKey: trimmedKey)
+        logMessage("Secondary: target configured")
+    }
+
+    /// Entfernt Host und Schlüssel des Zweitziels und schaltet es aus. Die Dateien der Outbox
+    /// bleiben liegen (nichts wird still verworfen) und zählen weiter in `getSyncStatus()`.
+    /// Erst `signOut()` entfernt sie.
+    public func clearSecondarySink() {
+        lanesSecondaryEnabled = false
+        OpenWearablesHealthSdkKeychain.clearSecondary()
+        logMessage("Secondary: target cleared, switched off")
+    }
+
+    /// Schalter des Zweitziels (D-08), Schlüssel `lanes.secondary.enabled` in der Defaults-Suite
+    /// des SDK. Standard aus. Wirkt nur mit konfiguriertem Ziel und im Modus `lanes`; dann reiht
+    /// jeder vom Primärziel angenommene Upload sein Paket zusätzlich für das Zweitziel ein. Ein
+    /// Umschalten gilt ab dem nächsten Zyklus.
+    public var secondarySinkEnabled: Bool {
+        get { lanesSecondaryEnabled }
+        set { lanesSecondaryEnabled = newValue }
+    }
+
+    /// Typauswahl des Zweitziels (K4), Schlüssel `lanes.secondary.types`: HK-Identifier wie
+    /// `HKQuantityTypeIdentifierHeartRate`. Leer heißt alle. Löschungen gehen immer vollständig mit.
+    public var secondarySinkTypes: [String] {
+        get { lanesSecondaryTypes }
+        set { lanesSecondaryTypes = newValue }
+    }
+
+    /// Die Statusschlüssel des Zweitziels. Lesen legt nichts an. `secondaryLastError` ist nur ein
+    /// Kurztext wie `HTTP 503`, `auth 401` oder `network(-1009)`, nie ein Antworttext.
+    internal func secondarySyncStatus() -> [String: Any] {
+        let outbox = makeSecondaryOutbox()
+        let counts = outbox.counts()
+        let state = outbox.state()
+        return [
+            "secondaryEnabled": lanesSecondaryEnabled,
+            "secondaryConfigured": secondaryCredentials() != nil,
+            "secondaryQueued": counts.queued,
+            "secondaryDead": counts.dead,
+            "secondaryGap": state.gapCount,
+            "secondaryLastSuccessAt": state.lastSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+            "secondaryLastError": state.lastError ?? NSNull()
+        ]
     }
     
     /// Resume an interrupted sync session.
@@ -2301,7 +2373,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
-    private func tryResumeAfterForeground() {
+    internal func tryResumeAfterForeground() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self = self else { return }
             
@@ -2309,6 +2381,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             // Fork (Plan 05-08): lanes mode, a running cycle takes the trigger as a live round.
             if self.orchestration == .lanes {
+                // Fork (Plan 09-04): wartende Pakete des Zweitziels, auch ohne Zyklus.
+                self.drainSecondaryIfActive(trigger: SyncTrigger.foreground.journalValue)
                 guard self.lanesHasWorkToResume() else { return }
                 self.logMessage("App returned to foreground - resuming lanes sync...")
                 self.syncAll(fullExport: false, trigger: .foreground) { _ in
@@ -2336,12 +2410,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         wasDisconnected = true
     }
     
-    private func tryResumeAfterNetworkRestored() {
+    internal func tryResumeAfterNetworkRestored() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self = self else { return }
             
             // Fork (Plan 05-08): lanes mode, a running cycle takes the trigger as a live round.
             if self.orchestration == .lanes {
+                // Fork (Plan 09-04): wartende Pakete des Zweitziels, auch ohne Zyklus.
+                self.drainSecondaryIfActive(trigger: SyncTrigger.network.journalValue)
                 guard self.lanesHasWorkToResume() else {
                     self.logMessage("No sync to resume")
                     return

@@ -322,7 +322,8 @@ extension OpenWearablesHealthSDK {
                 )
                 // D-08 (Plan 09-04): Nach jedem lanes-Zyklus die Outbox des Zweitziels anstoßen, auch
                 // ohne neues Paket (Wiederholungen). Nicht blockierend; ohne aktives Zweitziel nichts.
-                drainSecondaryIfActive()
+                let counts = sink.secondaryCounts
+                drainSecondaryIfActive(trigger: "cycle", enqueued: counts.enqueued, enqueueFailed: counts.failed)
             }
             // Observer contract (Pattern 8): wer auf eine Live-Runde wartet, bekommt seine
             // Rückmeldung, sobald die erste Runde dieses Zyklus fertig ist. Die Anforderung steht vor

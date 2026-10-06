@@ -73,16 +73,71 @@ extension OpenWearablesHealthSDK {
     /// auf einer Hintergrund-Queue, der Aufrufer wartet nicht. Ohne aktives Zweitziel geschieht nichts,
     /// auch kein Zugriff auf `health_secondary/`. Zwei Anstöße zugleich senden nichts doppelt, der
     /// zweite meldet `skipped` (`SecondaryUploader`).
-    internal func drainSecondaryIfActive(completion: ((SecondaryDrainResult?) -> Void)? = nil) {
+    ///
+    /// Angestoßen wird nach jedem lanes-Zyklus (`trigger` `cycle`, mit den Zahlen seines Senders), bei
+    /// der Rückkehr in den Vordergrund und wenn das Netz wieder da ist. 401/403 pausieren ohne eigene
+    /// Wartezeit (09-03): der nächste dieser Anstöße versucht es wieder.
+    internal func drainSecondaryIfActive(
+        trigger: String, enqueued: Int = 0, enqueueFailed: Int = 0,
+        completion: ((SecondaryDrainResult?) -> Void)? = nil
+    ) {
         guard lanesSecondaryEnabled, orchestration == .lanes, let target = secondaryTarget() else {
             completion?(nil)
             return
         }
-        let uploader = SecondaryUploader(outbox: makeSecondaryOutbox(), log: { [weak self] in self?.logMessage($0) })
-        DispatchQueue.global(qos: .utility).async {
+        let outbox = makeSecondaryOutbox()
+        let uploader = SecondaryUploader(
+            outbox: outbox,
+            session: secondarySessionOverride ?? SecondaryUploader.sharedSession,
+            log: { [weak self] in self?.logMessage($0) }
+        )
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             uploader.drain(target: target) { result in
+                self?.journalSecondary(
+                    result, trigger: trigger, enqueued: enqueued, enqueueFailed: enqueueFailed,
+                    queued: outbox.counts().queued
+                )
                 completion?(result)
             }
+        }
+    }
+
+    /// Ein Journal-Eintrag je Durchlauf mit Wirkung (Art `secondary`): nur Zahlen und als Status der
+    /// Kurztext des letzten Fehlers (`HTTP 503`, `auth 401`) oder `ok`. Kein Host, kein Schlüssel, kein
+    /// Nutzer, keine Ladung (T-09-13). Ein Durchlauf ohne jede Wirkung schreibt nichts, sonst liefe der
+    /// Ring (200) mit leeren Einträgen voll.
+    private func journalSecondary(
+        _ result: SecondaryDrainResult, trigger: String, enqueued: Int, enqueueFailed: Int, queued: Int
+    ) {
+        let acted = result.delivered + result.retried + result.dead > 0 || result.paused || result.lastError != nil
+        guard acted || enqueued > 0 || enqueueFailed > 0 else { return }
+        let status: String
+        if result.skipped {
+            status = "skipped"
+        } else {
+            status = result.lastError ?? "ok"
+        }
+        runJournal.record(SyncJournalEntry(
+            at: Date(),
+            kind: JournalKind.secondary,
+            trigger: trigger,
+            status: status,
+            records: result.delivered,
+            note: "delivered=\(result.delivered) retried=\(result.retried) dead=\(result.dead) "
+                + "paused=\(result.paused ? 1 : 0) queued=\(queued) enqueued=\(enqueued) failed=\(enqueueFailed)"
+        ))
+    }
+
+    /// Entfernt `health_secondary/` ganz: Outbox, `dead/` und Zustand. Nur für `signOut`, die Dateien
+    /// gehören dem abgemeldeten Nutzer.
+    internal func clearSecondaryOutbox() {
+        let directory = secondaryDirectory()
+        guard FileManager.default.fileExists(atPath: directory.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: directory)
+            logMessage("Cleared secondary outbox")
+        } catch {
+            logDiagnostic("Secondary: outbox could not be cleared")
         }
     }
 }

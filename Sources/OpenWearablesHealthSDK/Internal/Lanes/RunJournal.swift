@@ -20,7 +20,7 @@ import UIKit
 ///
 /// `kind` ist ein String statt eines Enums, damit ein Wert aus einer künftigen Version
 /// lesbar bleibt: `run`, `lease`, `adoption`, `delivery`, `wake`, `switch`, `backfill`,
-/// `deletions`, `spike`, `rejected`.
+/// `deletions`, `spike`, `rejected`, `secondary`.
 public struct SyncJournalEntry: Codable, Equatable, Sendable {
     /// Zeitpunkt des Eintrags. Bei `run` das Ende des Laufs.
     public var at: Date
@@ -99,6 +99,8 @@ internal enum JournalKind {
     static let lease = "lease"
     /// Löschwarteschlange: Kappen nach Alter oder Anzahl, beschädigte Datei beiseitegelegt (Plan 05-07).
     static let deletions = "deletions"
+    /// Ein Durchlauf des Zweitziel-Senders (Plan 09-04, D-08): nur Zahlen und ein Kurzstatus.
+    static let secondary = "secondary"
 }
 
 /// Ring aus den jüngsten Einträgen, atomar in eine JSON-Datei geschrieben.
