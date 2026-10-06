@@ -399,6 +399,10 @@ enum LaneDefaultsKey {
     static let needsCatchUp = "lanes.needsCatchUp"
     static let sendDeletions = "lanes.sendDeletions"
     static let anchorProbe = "lanes.anchorProbe"
+    /// Zweitziel (D-08, Plan 09-04). Standard aus.
+    static let secondaryEnabled = "lanes.secondary.enabled"
+    /// HK-Identifier, die ans Zweitziel gehen (K4). Fehlt oder leer: alle.
+    static let secondaryTypes = "lanes.secondary.types"
 }
 
 extension OpenWearablesHealthSDK {
@@ -424,12 +428,32 @@ extension OpenWearablesHealthSDK {
         set { defaults.set(newValue, forKey: LaneDefaultsKey.anchorProbe) }
     }
 
+    /// Zweitziel an (D-08). Standard aus: ohne ausdrückliches Einschalten entsteht keine Datei und
+    /// kein Aufruf. Wirkt nur mit konfiguriertem Ziel und im Modus `lanes` (`isSecondarySinkActive`).
+    internal var lanesSecondaryEnabled: Bool {
+        get { defaults.bool(forKey: LaneDefaultsKey.secondaryEnabled) }
+        set { defaults.set(newValue, forKey: LaneDefaultsKey.secondaryEnabled) }
+    }
+
+    /// Typauswahl des Zweitziels (K4), HK-Identifier. Leer heißt alle.
+    internal var lanesSecondaryTypes: [String] {
+        get { defaults.stringArray(forKey: LaneDefaultsKey.secondaryTypes) ?? [] }
+        set {
+            if newValue.isEmpty {
+                defaults.removeObject(forKey: LaneDefaultsKey.secondaryTypes)
+            } else {
+                defaults.set(newValue, forKey: LaneDefaultsKey.secondaryTypes)
+            }
+        }
+    }
+
     internal func makeDeletionQueue() -> DeletionQueue {
         DeletionQueue(
             directory: stateBaseDirectory().appendingPathComponent("health_deletions", isDirectory: true),
             clock: SystemLaneClock(),
             journal: runJournal,
-            log: { [weak self] in self?.logMessage($0) }
+            log: { [weak self] in self?.logMessage($0) },
+            tracksSecondary: isSecondarySinkActive
         )
     }
 

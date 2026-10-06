@@ -19,6 +19,10 @@ import Foundation
 //                      "queuedAt": "2026-10-04T08:15:30.123Z",
 //                      "sentAt": "2026-10-04T08:16:02.000Z" } ] }   // sentAt fehlt = ungesendet
 //
+// Zweitziel (Plan 09-04, D-08): Jedes Ziel hat sein eigenes Gesendet-Kennzeichen. `sentAt` gehört
+// dem Primärziel, `sentSecondaryAt` dem Zweitziel. Das Feld ist additiv und fehlt, solange es leer
+// ist: die Dateiversion bleibt 1, eine Datei ohne `sentSecondaryAt` dekodiert wie bisher.
+//
 // Gedeckelt nach Anzahl und Alter (Entscheidung vom 04.10.2026). Jedes Kappen steht im Log und
 // im Journal (`kind: "deletions"`), mit der Zahl der Einträge, die noch ungesendet waren: das
 // ist der eigentliche Verlust, gesendete Einträge zu verlieren kostet nichts.
@@ -36,6 +40,8 @@ final class DeletionQueue: DeletionQueueing {
         let type: String
         let queuedAt: Date
         var sentAt: Date?
+        /// Wann die Löschung dauerhaft in die Outbox des Zweitziels kam. Fehlt = dort ungesendet.
+        var sentSecondaryAt: Date?
     }
 
     private struct FileContent: Codable {
@@ -54,6 +60,9 @@ final class DeletionQueue: DeletionQueueing {
     private let clock: LaneClock
     private let journal: RunJournal?
     private let log: (String) -> Void
+    /// Das Zweitziel ist aktiv: ein Kappen nennt dann auch, wie viele dort noch ungesendet waren.
+    /// Aus: Log und Journal bleiben wie vor 09-04.
+    private let tracksSecondary: Bool
 
     /// Serielle Queue je Datei, für den ganzen Prozess: Lesen, Ändern und Schreiben sind ein
     /// Schritt, auch über Instanzen hinweg (Review LO-07). Zyklus, abgelöster Zyklus und
@@ -66,9 +75,11 @@ final class DeletionQueue: DeletionQueueing {
         journal: RunJournal?,
         log: @escaping (String) -> Void,
         maxEntries: Int = 50_000,
-        maxAge: TimeInterval = 90 * 24 * 3600
+        maxAge: TimeInterval = 90 * 24 * 3600,
+        tracksSecondary: Bool = false
     ) {
         self.directory = directory
+        self.tracksSecondary = tracksSecondary
         self.queue = LaneFileLocks.queue(for: directory.appendingPathComponent("queue.json"))
         self.clock = clock
         self.journal = journal
@@ -86,6 +97,14 @@ final class DeletionQueue: DeletionQueueing {
     /// - Throws: `DeletionQueueError.unreadable` oder einen Schreibfehler. Der Kern hält dann
     ///   den Anchor fest, die Löschung bliebe sonst unbemerkt verloren.
     func enqueue(_ refs: [DeletedRef], sentAt: Date?) throws {
+        try enqueue(refs, sentAt: sentAt, sentSecondaryAt: nil)
+    }
+
+    /// Wie `enqueue(_:sentAt:)`, dazu das Kennzeichen des Zweitziels (Plan 09-04): Der Sender trägt
+    /// die eigenen Löschungen eines Pakets damit ein, sobald das Zweitpaket dauerhaft in der Outbox
+    /// liegt. Das geschieht vor dem Kern, der dieselben Einträge danach mit seinem `sentAt` erreicht.
+    /// Jedes Kennzeichen wird nur gesetzt, wenn es fehlt, und nie wieder entfernt.
+    func enqueue(_ refs: [DeletedRef], sentAt: Date?, sentSecondaryAt: Date?) throws {
         guard !refs.isEmpty else { return }
         try queue.sync {
             guard case .entries(var entries) = loadLocked() else { throw DeletionQueueError.unreadable }
@@ -101,8 +120,14 @@ final class DeletionQueue: DeletionQueueing {
                         entries[index].sentAt = sentAt
                         changed = true
                     }
+                    if entries[index].sentSecondaryAt == nil, let sentSecondaryAt = sentSecondaryAt {
+                        entries[index].sentSecondaryAt = sentSecondaryAt
+                        changed = true
+                    }
                 } else {
-                    entries.append(Entry(id: ref.id, type: ref.type, queuedAt: now, sentAt: sentAt))
+                    entries.append(Entry(
+                        id: ref.id, type: ref.type, queuedAt: now, sentAt: sentAt, sentSecondaryAt: sentSecondaryAt
+                    ))
                     position[ref.id] = entries.count - 1
                     changed = true
                 }
@@ -154,12 +179,58 @@ final class DeletionQueue: DeletionQueueing {
         }
     }
 
+    // MARK: Zweitziel (Plan 09-04)
+
+    /// Die ältesten fürs Zweitziel ungesendeten Löschungen zuerst. Das Kennzeichen des Primärziels
+    /// spielt keine Rolle. Eine nicht lesbare Datei ergibt leer.
+    func unsentSecondary(limit: Int) -> [DeletedRef] {
+        guard limit > 0 else { return [] }
+        return queue.sync { () -> [DeletedRef] in
+            guard case .entries(let entries) = loadLocked() else { return [] }
+            var result: [DeletedRef] = []
+            for entry in entries where entry.sentSecondaryAt == nil {
+                result.append(DeletedRef(id: entry.id, type: entry.type))
+                if result.count == limit { break }
+            }
+            return result
+        }
+    }
+
+    /// Setzt `sentSecondaryAt` für die genannten Kennungen. `sentAt` bleibt unberührt, ein schon
+    /// gesetztes Kennzeichen bei seinem Zeitpunkt, unbekannte Kennungen werden übergangen.
+    func markSentSecondary(ids: [String], at date: Date) throws {
+        guard !ids.isEmpty else { return }
+        let wanted = Set(ids)
+        try queue.sync {
+            guard case .entries(var entries) = loadLocked() else { throw DeletionQueueError.unreadable }
+
+            var changed = false
+            for index in entries.indices
+            where entries[index].sentSecondaryAt == nil && wanted.contains(entries[index].id) {
+                entries[index].sentSecondaryAt = date
+                changed = true
+            }
+            guard changed else { return }
+            try writeCapped(&entries, now: clock.now())
+        }
+    }
+
+    /// Alle Einträge, ältester zuerst. Eine nicht lesbare Datei ergibt leer.
+    func entries() -> [Entry] {
+        queue.sync { () -> [Entry] in
+            guard case .entries(let entries) = loadLocked() else { return [] }
+            return entries
+        }
+    }
+
     // MARK: Deckel
 
     private struct Capped {
         var byAge = 0
         var byCount = 0
         var unsent = 0
+        /// Fürs Zweitziel ungesendet. Nur genannt, wenn die Warteschlange das Zweitziel führt.
+        var unsentSecondary = 0
         var total: Int { byAge + byCount }
     }
 
@@ -174,6 +245,7 @@ final class DeletionQueue: DeletionQueueing {
             let dropped = entries.filter { $0.queuedAt < cutoff }
             capped.byAge = dropped.count
             capped.unsent += dropped.filter { $0.sentAt == nil }.count
+            capped.unsentSecondary += dropped.filter { $0.sentSecondaryAt == nil }.count
             entries = fresh
         }
 
@@ -182,6 +254,7 @@ final class DeletionQueue: DeletionQueueing {
             let dropped = entries.prefix(overflow)
             capped.byCount = overflow
             capped.unsent += dropped.filter { $0.sentAt == nil }.count
+            capped.unsentSecondary += dropped.filter { $0.sentSecondaryAt == nil }.count
             entries.removeFirst(overflow)
         }
 
@@ -199,12 +272,18 @@ final class DeletionQueue: DeletionQueueing {
         case (true, false): reason = "age"; label = "Alter"
         default: reason = "count"; label = "Anzahl"
         }
-        log("Löschwarteschlange gekappt: \(capped.total) Einträge (\(label)), davon \(capped.unsent) ungesendet")
+        var line = "Löschwarteschlange gekappt: \(capped.total) Einträge (\(label)), davon \(capped.unsent) ungesendet"
+        var note = "capped reason=\(reason) unsent=\(capped.unsent)"
+        if tracksSecondary {
+            line += ", fürs Zweitziel \(capped.unsentSecondary) ungesendet"
+            note += " unsentSecondary=\(capped.unsentSecondary)"
+        }
+        log(line)
         journal?.record(SyncJournalEntry(
             at: date,
             kind: JournalKind.deletions,
             deletions: capped.total,
-            note: "capped reason=\(reason) unsent=\(capped.unsent)"
+            note: note
         ))
     }
 

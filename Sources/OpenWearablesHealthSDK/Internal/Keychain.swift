@@ -20,7 +20,10 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let trackedTypesKey = "trackedTypes"
     private static let appInstalledKey = "appInstalled"
     private static let syncDaysBackKey = "syncDaysBack"
-    
+    // Fork (Plan 09-04, D-08): Zweitziel, beide im Keychain.
+    private static let secondaryHostKey = "secondaryHost"
+    private static let secondaryApiKeyKey = "secondaryApiKey"
+
     // MARK: - Fresh Install Detection
     
     /// Call this on app launch to clear Keychain if app was reinstalled.
@@ -168,14 +171,38 @@ internal class OpenWearablesHealthSdkKeychain {
     static func getApiKey() -> String? {
         return load(key: apiKeyKey)
     }
-    
+
+    // MARK: - Zweitziel (Fork, Plan 09-04, D-08)
+
+    /// Host und API-Schlüssel des Zweitziels. Beide im Keychain mit
+    /// `AfterFirstUnlockThisDeviceOnly`, damit ein Kaltstart im Hintergrund nach dem ersten
+    /// Entsperren liefern kann. Der Schlüssel ist geheim, der Host liegt der Einfachheit halber daneben.
+    static func saveSecondary(host: String, apiKey: String) {
+        save(key: secondaryHostKey, value: host)
+        save(key: secondaryApiKeyKey, value: apiKey)
+    }
+
+    static func getSecondaryHost() -> String? {
+        return load(key: secondaryHostKey)
+    }
+
+    static func getSecondaryApiKey() -> String? {
+        return load(key: secondaryApiKeyKey)
+    }
+
+    static func clearSecondary() {
+        delete(key: secondaryHostKey)
+        delete(key: secondaryApiKeyKey)
+    }
+
     // MARK: - Clear
-    
+
     static func clearAll() {
         delete(key: accessTokenKey)
         delete(key: refreshTokenKey)
         delete(key: userIdKey)
         delete(key: apiKeyKey)
+        clearSecondary()
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
         defaults.removeObject(forKey: customRefreshUrlKey)

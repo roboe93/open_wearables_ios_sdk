@@ -32,12 +32,14 @@ final class DeletionQueueTests: XCTestCase {
         super.tearDown()
     }
 
-    private func makeQueue(maxEntries: Int = 50_000, maxAge: TimeInterval = 90 * 24 * 3600) -> DeletionQueue {
+    private func makeQueue(
+        maxEntries: Int = 50_000, maxAge: TimeInterval = 90 * 24 * 3600, tracksSecondary: Bool = false
+    ) -> DeletionQueue {
         DeletionQueue(
             directory: directory.appendingPathComponent("health_deletions", isDirectory: true),
             clock: clock, journal: journal,
             log: { [unowned self] in self.logged.append($0) },
-            maxEntries: maxEntries, maxAge: maxAge
+            maxEntries: maxEntries, maxAge: maxAge, tracksSecondary: tracksSecondary
         )
     }
 
@@ -355,5 +357,108 @@ final class DeletionQueueTests: XCTestCase {
             }
             XCTAssertEqual(sdk.makeDeletionQueue().stats().total, 40)
         }
+    }
+
+    // MARK: Zweitziel (Plan 09-04): ein Gesendet-Kennzeichen je Ziel
+
+    private func entry(_ queue: DeletionQueue, _ id: String) -> DeletionQueue.Entry? {
+        queue.entries().first { $0.id == id }
+    }
+
+    /// Eine Datei von 0.15.0-ow.3 (ohne `sentSecondaryAt`) dekodiert. Für das Zweitziel gilt dann
+    /// jeder Eintrag als ungesendet, für das Primärziel bleibt `sentAt` maßgeblich.
+    func testAFileWithoutTheSecondaryMarkStillDecodes() throws {
+        let folder = queueFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let json = """
+        {"version": 1, "entries": [
+          {"id": "x1", "type": "\(weight)", "queuedAt": "2026-10-04T08:00:00.000Z", "sentAt": "2026-10-04T08:01:00.000Z"},
+          {"id": "x2", "type": "\(steps)", "queuedAt": "2026-10-04T08:02:00.000Z"}
+        ]}
+        """
+        try Data(json.utf8).write(to: queueFile)
+
+        let queue = makeQueue()
+        XCTAssertEqual(queue.unsentSecondary(limit: 10).map(\.id), ["x1", "x2"])
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["x2"])
+        XCTAssertEqual(queue.entries().count, 2)
+        XCTAssertNil(entry(queue, "x1")?.sentSecondaryAt)
+    }
+
+    /// `markSentSecondary` setzt nur das Kennzeichen des Zweitziels. Ein schon gesetztes bleibt bei
+    /// seinem Zeitpunkt, unbekannte Kennungen werden übergangen.
+    func testMarkSentSecondarySetsOnlyTheSecondaryMark() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("a"), ref("b")], sentAt: nil)
+        try queue.markSent(ids: ["a"], at: epoch.addingTimeInterval(10))
+
+        try queue.markSentSecondary(ids: ["a", "b", "gibt-es-nicht"], at: epoch.addingTimeInterval(20))
+        try queue.markSentSecondary(ids: ["a"], at: epoch.addingTimeInterval(99))
+
+        XCTAssertEqual(entry(queue, "a")?.sentAt, epoch.addingTimeInterval(10))
+        XCTAssertEqual(entry(queue, "a")?.sentSecondaryAt, epoch.addingTimeInterval(20))
+        XCTAssertNil(entry(queue, "b")?.sentAt, "das Primärziel bleibt ungesendet")
+        XCTAssertEqual(entry(queue, "b")?.sentSecondaryAt, epoch.addingTimeInterval(20))
+        XCTAssertTrue(queue.unsentSecondary(limit: 10).isEmpty)
+        XCTAssertEqual(queue.unsent(limit: 10).map(\.id), ["b"])
+        XCTAssertEqual(queue.entries().count, 2)
+    }
+
+    /// Die ältesten fürs Zweitziel ungesendeten zuerst, höchstens `limit`. Das Primär-Kennzeichen
+    /// spielt dafür keine Rolle.
+    func testUnsentSecondaryReturnsTheOldestFirstAndHonoursTheLimit() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("1")], sentAt: epoch)
+        try queue.enqueue([ref("2")], sentAt: nil, sentSecondaryAt: epoch)
+        try queue.enqueue([ref("3", type: steps)], sentAt: nil)
+        try queue.enqueue([ref("4")], sentAt: nil)
+
+        XCTAssertEqual(queue.unsentSecondary(limit: 2), [ref("1"), ref("3", type: steps)])
+        XCTAssertEqual(queue.unsentSecondary(limit: 10).map(\.id), ["1", "3", "4"])
+        XCTAssertTrue(queue.unsentSecondary(limit: 0).isEmpty)
+    }
+
+    /// Einreihen mit dem Kennzeichen des Zweitziels: neue Einträge entstehen damit, vorhandene
+    /// bekommen es, wenn sie es noch nicht haben. `queuedAt` bleibt das früheste. Ein späteres
+    /// Einreihen des Kerns mit `sentAt` lässt das Kennzeichen des Zweitziels stehen.
+    func testEnqueueWithTheSecondaryMarkAddsNewEntriesAndMarksExistingOnes() throws {
+        let queue = makeQueue()
+        try queue.enqueue([ref("a")], sentAt: nil)
+        clock.advance(30)
+        try queue.enqueue([ref("a"), ref("b")], sentAt: nil, sentSecondaryAt: epoch.addingTimeInterval(30))
+
+        XCTAssertEqual(entry(queue, "a")?.queuedAt, epoch)
+        XCTAssertEqual(entry(queue, "a")?.sentSecondaryAt, epoch.addingTimeInterval(30))
+        XCTAssertEqual(entry(queue, "b")?.sentSecondaryAt, epoch.addingTimeInterval(30))
+        XCTAssertNil(entry(queue, "b")?.sentAt)
+
+        let entries = try XCTUnwrap(try fileJSON()["entries"] as? [[String: Any]])
+        let fileB = try XCTUnwrap(entries.first { $0["id"] as? String == "b" })
+        XCTAssertEqual(Set(fileB.keys), ["id", "type", "queuedAt", "sentSecondaryAt"])
+
+        try queue.enqueue([ref("b")], sentAt: epoch.addingTimeInterval(40))
+        XCTAssertEqual(entry(queue, "b")?.sentAt, epoch.addingTimeInterval(40))
+        XCTAssertEqual(entry(queue, "b")?.sentSecondaryAt, epoch.addingTimeInterval(30))
+    }
+
+    /// Ist das Zweitziel aktiv, nennt ein Kappen auch die dort ungesendeten Einträge. Ohne Zweitziel
+    /// bleiben Log und Journal wie vor 09-04.
+    func testTheCapCountsTheSecondaryOnlyWhenTheQueueTracksIt() throws {
+        let tracked = makeQueue(maxEntries: 1, tracksSecondary: true)
+        try tracked.enqueue([ref("1")], sentAt: epoch)          // Primär gesendet, Zweitziel nicht
+        try tracked.enqueue([ref("2")], sentAt: nil)            // kappt "1"
+
+        let trackedNote = try XCTUnwrap(journal.entries().last { $0.kind == "deletions" }?.note)
+        XCTAssertTrue(trackedNote.contains("unsent=0"), trackedNote)
+        XCTAssertTrue(trackedNote.contains("unsentSecondary=1"), trackedNote)
+        XCTAssertTrue(logged.contains { $0.contains("Zweitziel") }, "\(logged)")
+
+        logged = []
+        let plain = makeQueue(maxEntries: 1)
+        try plain.enqueue([ref("3")], sentAt: nil)              // kappt "2"
+
+        let plainNote = try XCTUnwrap(journal.entries().last { $0.kind == "deletions" }?.note)
+        XCTAssertEqual(plainNote, "capped reason=count unsent=1")
+        XCTAssertFalse(logged.contains { $0.contains("Zweitziel") }, "\(logged)")
     }
 }

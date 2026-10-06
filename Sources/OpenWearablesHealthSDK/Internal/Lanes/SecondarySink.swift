@@ -3,8 +3,8 @@ import Foundation
 // Fork-Zusatz (roboe93), Plan 09-03 (D-08). Das Zweitziel: dieselben Pakete zusätzlich an einen
 // zweiten Server, mit eigener Datei-Outbox.
 //
-// Eingehängt wird es erst in 09-04 (nach dem 2xx des Primärziels einreihen, hinter einem Schalter,
-// der standardmäßig aus ist). Hier entstehen nur die Bausteine:
+// Eingehängt seit 09-04: `PayloadSink` reiht nach dem 2xx des Primärziels ein, hinter dem Schalter
+// `lanes.secondary.enabled` (Standard aus), nur im Modus `lanes`. Die Bausteine:
 //
 //   - `SecondaryOutbox`: Dateien unter `health_secondary/outbox/`, Reihenfolge nach Dateiname,
 //     `dead/` für Aufgegebenes, Deckel nach Größe und Alter. Nie stilles Löschen: was nicht
@@ -36,6 +36,54 @@ extension OpenWearablesHealthSDK {
     /// `health_secondary/` neben den übrigen Zustandsordnern.
     internal func secondaryDirectory() -> URL {
         stateBaseDirectory().appendingPathComponent("health_secondary", isDirectory: true)
+    }
+
+    // MARK: Einhängen (Plan 09-04)
+
+    /// Host und Schlüssel aus dem Keychain, wenn beide brauchbar sind: ein absoluter http(s)-Host
+    /// und ein nicht leerer Schlüssel.
+    internal func secondaryCredentials() -> (host: URL, apiKey: String)? {
+        guard let hostText = OpenWearablesHealthSdkKeychain.getSecondaryHost(),
+              let host = Self.absoluteHTTPURL(from: hostText),
+              let apiKey = OpenWearablesHealthSdkKeychain.getSecondaryApiKey()?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else { return nil }
+        return (host, apiKey)
+    }
+
+    /// Das Ziel für den Sender: Zugangsdaten des Zweitziels und der Nutzer des Primärziels.
+    internal func secondaryTarget() -> SecondaryTarget? {
+        guard let credentials = secondaryCredentials(), let userId = userId else { return nil }
+        return SecondaryTarget(host: credentials.host, apiKey: credentials.apiKey, userId: userId)
+    }
+
+    /// D-08: Das Zweitziel wirkt nur, wenn der Schalter an ist (Standard aus), ein Ziel konfiguriert
+    /// ist und der Modus `lanes` gilt. Im Modus `upstream` ruht es, vorhandene Dateien bleiben liegen
+    /// (Recherche, Dual-Sink Punkt 2).
+    internal var isSecondarySinkActive: Bool {
+        lanesSecondaryEnabled && orchestration == .lanes && secondaryTarget() != nil
+    }
+
+    /// Eine Instanz über `health_secondary/`. Legt nichts an: Ordner entstehen erst beim Einreihen.
+    internal func makeSecondaryOutbox() -> SecondaryOutbox {
+        SecondaryOutbox(baseDirectory: secondaryDirectory(), log: { [weak self] in self?.logMessage($0) })
+    }
+
+    /// Stößt einen Durchlauf des Zweitziel-Senders an, nie blockierend (T-09-14): Die Arbeit läuft
+    /// auf einer Hintergrund-Queue, der Aufrufer wartet nicht. Ohne aktives Zweitziel geschieht nichts,
+    /// auch kein Zugriff auf `health_secondary/`. Zwei Anstöße zugleich senden nichts doppelt, der
+    /// zweite meldet `skipped` (`SecondaryUploader`).
+    internal func drainSecondaryIfActive(completion: ((SecondaryDrainResult?) -> Void)? = nil) {
+        guard lanesSecondaryEnabled, orchestration == .lanes, let target = secondaryTarget() else {
+            completion?(nil)
+            return
+        }
+        let uploader = SecondaryUploader(outbox: makeSecondaryOutbox(), log: { [weak self] in self?.logMessage($0) })
+        DispatchQueue.global(qos: .utility).async {
+            uploader.drain(target: target) { result in
+                completion?(result)
+            }
+        }
     }
 }
 
@@ -69,7 +117,8 @@ struct SecondaryState: Codable, Equatable {
     var version: Int = SecondaryState.currentVersion
     /// Schlüssel ist der Dateiname in `outbox/`.
     var files: [String: SecondaryFileState] = [:]
-    /// Pakete, die der Deckel nach `dead/` verschoben hat: eine Lücke im Zweitziel.
+    /// Pakete, die das Zweitziel nie erreichen: vom Deckel nach `dead/` verschoben oder gar nicht
+    /// erst einreihbar (Plan 09-04). Eine Lücke im Zweitziel.
     var gapCount: Int = 0
     var lastGapAt: Date?
     var lastSuccessAt: Date?
@@ -313,6 +362,24 @@ final class SecondaryOutbox {
             log("Secondary: outbox over cap, moved \(moved) package(s) to dead/")
         } catch {
             log("Secondary: outbox over cap, moved \(moved) package(s) to dead/, gap count not recorded")
+        }
+    }
+
+    /// Ein Paket ließ sich nicht einreihen (Platte voll, Rechte, Ordner fehlt). Es erreicht das
+    /// Zweitziel nie und zählt deshalb als Lücke wie ein vom Deckel verschobenes (Plan 09-04).
+    /// Scheitert auch das, bleibt es beim Log und bei der Zahl im Journal des Zyklus.
+    func recordEnqueueFailure() {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = clock.now()
+        do {
+            try updateStateLocked { state in
+                state.gapCount += 1
+                state.lastGapAt = now
+                state.lastError = "enqueue failed"
+            }
+        } catch {
+            log("Secondary: enqueue failed, gap count not recorded")
         }
     }
 
