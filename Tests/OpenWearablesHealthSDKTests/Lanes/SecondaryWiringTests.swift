@@ -264,14 +264,14 @@ final class SecondaryWiringTests: XCTestCase {
     // MARK: - Ruhe
 
     /// Schalter aus: kein Anstoß, kein Zugriff auf den Ordner, auch mit konfiguriertem Ziel.
-    func testWithTheSwitchOffADrainDoesNothing() throws {
-        try withWiring { sdk in
+    func testWithTheSwitchOffADrainDoesNothing() {
+        withWiring { sdk in
             sdk.configureSecondarySink(host: secondaryHost, apiKey: secondaryKey)
             StubURLProtocol.install { _ in .status(202) }
 
             let result = drain(sdk)
 
-            XCTAssertNotNil(result, "der Rückruf kommt")
+            XCTAssertTrue(result != nil, "der Rückruf kommt")
             XCTAssertNil(result ?? nil, "nichts angestoßen")
             XCTAssertFalse(FileManager.default.fileExists(atPath: sdk.secondaryDirectory().path))
             XCTAssertTrue(StubURLProtocol.requests.isEmpty)
